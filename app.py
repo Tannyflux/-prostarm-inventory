@@ -9,19 +9,18 @@ import io
 import json
 import os
 import secrets
-import sqlite3
-import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import psycopg
+
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = Path("/tmp/prostarm_inventory.db")
 STATIC_DIR = ROOT / "static"
-WORKBOOK_PATH = ROOT / "Book1.xlsx"
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 SECRET = os.environ.get("PROSTARM_SECRET", "change-this-secret-before-production")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
@@ -31,11 +30,66 @@ def now_iso() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class Row(dict):
+    """Dict-based row that also supports positional access like sqlite3.Row."""
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return dict.__getitem__(self, key)
+
+
+def _row_factory(cursor):
+    columns = [c.name for c in cursor.description] if cursor.description else []
+
+    def make_row(values):
+        return Row(zip(columns, values))
+
+    return make_row
+
+
+class Conn:
+    """Thin wrapper that gives a psycopg connection a sqlite-like interface."""
+
+    def __init__(self) -> None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not configured")
+        self._conn = psycopg.connect(DATABASE_URL, row_factory=_row_factory)
+
+    def execute(self, sql: str, params: tuple | list = ()):
+        cur = self._conn.cursor()
+        cur.execute(sql.replace("?", "%s"), tuple(params) if params else None)
+        return cur
+
+    def executemany(self, sql: str, seq) -> None:
+        cur = self._conn.cursor()
+        cur.executemany(sql.replace("?", "%s"), [tuple(p) for p in seq])
+
+    def executescript(self, sql: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def __enter__(self) -> "Conn":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if exc_type:
+                self._conn.rollback()
+            else:
+                self._conn.commit()
+        finally:
+            self._conn.close()
+
+
+def db() -> Conn:
+    return Conn()
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -62,7 +116,7 @@ def sign(data: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
-def create_token(user: sqlite3.Row) -> str:
+def create_token(user) -> str:
     header = b64json({"alg": "HS256", "typ": "JWT"})
     payload = b64json({
         "sub": user["id"],
@@ -92,14 +146,14 @@ def read_token(token: str) -> dict | None:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS branches (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   code TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
   type TEXT NOT NULL DEFAULT 'WAREHOUSE'
 );
 
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   full_name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
@@ -107,12 +161,12 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS categories (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS materials (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   sku TEXT NOT NULL UNIQUE,
   item_name TEXT NOT NULL,
   description TEXT,
@@ -120,22 +174,22 @@ CREATE TABLE IF NOT EXISTS materials (
   destination_branch_id INTEGER REFERENCES branches(id),
   category_id INTEGER NOT NULL REFERENCES categories(id),
   uom TEXT NOT NULL,
-  minimum_stock_level REAL NOT NULL DEFAULT 0,
-  standard_unit_price REAL NOT NULL DEFAULT 0
+  minimum_stock_level DOUBLE PRECISION NOT NULL DEFAULT 0,
+  standard_unit_price DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS inventory_balances (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   material_id INTEGER NOT NULL REFERENCES materials(id),
   branch_id INTEGER NOT NULL REFERENCES branches(id),
   condition TEXT NOT NULL DEFAULT 'GOOD',
-  quantity_on_hand REAL NOT NULL DEFAULT 0,
-  average_unit_cost REAL NOT NULL DEFAULT 0,
+  quantity_on_hand DOUBLE PRECISION NOT NULL DEFAULT 0,
+  average_unit_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
   UNIQUE(material_id, branch_id, condition)
 );
 
 CREATE TABLE IF NOT EXISTS stock_transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   transaction_no TEXT NOT NULL UNIQUE,
   transaction_type TEXT NOT NULL,
   branch_id INTEGER NOT NULL REFERENCES branches(id),
@@ -149,24 +203,28 @@ CREATE TABLE IF NOT EXISTS stock_transactions (
 );
 
 CREATE TABLE IF NOT EXISTS stock_transaction_lines (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   transaction_id INTEGER NOT NULL REFERENCES stock_transactions(id),
   material_id INTEGER NOT NULL REFERENCES materials(id),
-  quantity REAL NOT NULL,
-  unit_price REAL NOT NULL DEFAULT 0,
+  quantity DOUBLE PRECISION NOT NULL,
+  unit_price DOUBLE PRECISION NOT NULL DEFAULT 0,
   condition_from TEXT,
   condition_to TEXT
 );
 """
 
 
-def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+def add_column_if_missing(conn: Conn, table: str, column: str, definition: str) -> None:
+    rows = conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        (table,),
+    ).fetchall()
+    columns = {row["column_name"] for row in rows}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
-def ensure_branch(conn: sqlite3.Connection, code: str, name: str, branch_type: str = "BRANCH") -> int:
+def ensure_branch(conn: Conn, code: str, name: str, branch_type: str = "BRANCH") -> int:
     row = conn.execute("SELECT id FROM branches WHERE code = ?", (code,)).fetchone()
     if row:
         return int(row["id"])
@@ -176,7 +234,7 @@ def ensure_branch(conn: sqlite3.Connection, code: str, name: str, branch_type: s
     ).fetchone()[0])
 
 
-def migrate(conn: sqlite3.Connection) -> None:
+def migrate(conn: Conn) -> None:
     add_column_if_missing(conn, "materials", "source_location", "TEXT")
     add_column_if_missing(conn, "materials", "destination_branch_id", "INTEGER REFERENCES branches(id)")
     ensure_branch(conn, "MAHAPE", "Mahape", "WAREHOUSE")
@@ -200,13 +258,16 @@ def parse_number(value: object) -> float | None:
         return None
 
 
-def load_xlsx_rows(path: Path) -> list[dict[str, object]]:
+def load_xlsx_rows(source) -> list[dict[str, object]]:
+    """Accepts a file path, bytes, or file-like object for an .xlsx workbook."""
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
     ns = {
         "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
         "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
         "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
     }
-    with zipfile.ZipFile(path) as zf:
+    with zipfile.ZipFile(source) as zf:
         shared: list[str] = []
         if "xl/sharedStrings.xml" in zf.namelist():
             root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
@@ -242,20 +303,44 @@ def load_xlsx_rows(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def import_book1_inventory(conn: sqlite3.Connection) -> bool:
-    if not WORKBOOK_PATH.exists():
-        return False
+def condition_from_name(item_name: str) -> str:
+    lowered = item_name.lower()
+    if "buyback" in lowered or "buy back" in lowered:
+        return "BUYBACK"
+    if "reject" in lowered:
+        return "REJECTED"
+    if "scrap" in lowered or "srap" in lowered:
+        return "SCRAP"
+    if "damage" in lowered or "damaged" in lowered or "faulty" in lowered:
+        return "DAMAGED"
+    return "GOOD"
 
-    rows = load_xlsx_rows(WORKBOOK_PATH)
-    branch_name = "Mahape"
-    for row in rows:
-        if row.get("B") and str(row.get("B")).strip().lower() == "mahape":
-            branch_name = str(row.get("B")).strip()
-            break
 
-    branch_id = ensure_branch(conn, "MAHAPE", branch_name, "WAREHOUSE")
+def parse_stock_file(filename: str, data: bytes) -> list[dict[str, object]]:
+    """Parse an uploaded .xlsx or .csv file into letter-keyed rows (A, B, C, D...)."""
+    name = (filename or "").lower()
+    if name.endswith(".csv"):
+        text = data.decode("utf-8-sig", errors="replace")
+        rows: list[dict[str, object]] = []
+        for raw in csv.reader(io.StringIO(text)):
+            record: dict[str, object] = {}
+            for index, value in enumerate(raw):
+                record[chr(ord("A") + index)] = value
+            rows.append(record)
+        return rows
+    return load_xlsx_rows(data)
 
-    category_id = conn.execute("INSERT INTO categories(name) VALUES (?) RETURNING id", ("Imported Godown Stock",)).fetchone()[0]
+
+def import_stock_rows(conn: Conn, rows: list[dict[str, object]], branch_id: int, user_id: int, source_label: str) -> int:
+    """Import item/quantity/rate/value rows (columns A-D) as opening stock for a branch."""
+    category_row = conn.execute("SELECT id FROM categories WHERE name = ?", ("Imported Stock",)).fetchone()
+    if category_row:
+        category_id = category_row["id"]
+    else:
+        category_id = conn.execute(
+            "INSERT INTO categories(name) VALUES (?) RETURNING id", ("Imported Stock",)
+        ).fetchone()[0]
+
     imported = 0
     seen: dict[str, int] = {}
     for index, row in enumerate(rows, start=1):
@@ -266,18 +351,11 @@ def import_book1_inventory(conn: sqlite3.Connection) -> bool:
         rate = (value / quantity) if value is not None and quantity else displayed_rate
         if not item_name or quantity is None or quantity <= 0:
             continue
+        # Skip a header row such as "Item / Description"
+        if quantity is None and index == 1:
+            continue
 
-        lowered = item_name.lower()
-        condition = "GOOD"
-        if "buyback" in lowered or "buy back" in lowered:
-            condition = "BUYBACK"
-        elif "reject" in lowered:
-            condition = "REJECTED"
-        elif "scrap" in lowered or "srap" in lowered:
-            condition = "SCRAP"
-        elif "damage" in lowered or "damaged" in lowered or "faulty" in lowered:
-            condition = "DAMAGED"
-
+        condition = condition_from_name(item_name)
         base_sku = "".join(ch if ch.isalnum() else "-" for ch in item_name.upper()).strip("-")
         base_sku = "-".join(part for part in base_sku.split("-") if part)[:42] or f"ITEM-{index}"
         seen[base_sku] = seen.get(base_sku, 0) + 1
@@ -288,7 +366,7 @@ def import_book1_inventory(conn: sqlite3.Connection) -> bool:
             INSERT INTO materials(sku, item_name, description, source_location, destination_branch_id, category_id, uom, minimum_stock_level, standard_unit_price)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
             """,
-            (sku, item_name, f"Imported from Book1.xlsx row {index}", "Book1.xlsx Godown Summary", branch_id, category_id, "PCS", 0, rate),
+            (sku, item_name, f"Imported from {source_label} row {index}", source_label, branch_id, category_id, "PCS", 0, rate),
         ).fetchone()[0]
         conn.execute(
             """
@@ -299,7 +377,7 @@ def import_book1_inventory(conn: sqlite3.Connection) -> bool:
         )
         imported += 1
 
-    user_id = conn.execute("SELECT id FROM users WHERE email='admin@prostarm.com'").fetchone()[0]
+    tx_no = f"IMP-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
     conn.execute(
         """
         INSERT INTO stock_transactions(
@@ -307,88 +385,37 @@ def import_book1_inventory(conn: sqlite3.Connection) -> bool:
           department_or_client, transaction_date, remarks, created_by, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        ("TXN-BOOK1-IMPORT", "INWARD", branch_id, "BOOK1.XLSX", "Opening import", None, "2026-06-19", f"Imported {imported} stock rows from Book1.xlsx", user_id, now_iso()),
+        (tx_no, "INWARD", branch_id, source_label, "Stock import", None, dt.date.today().isoformat(), f"Imported {imported} stock rows from {source_label}", user_id, now_iso()),
     )
-    return imported > 0
+    return imported
+
+
+def clear_stock_data(conn: Conn) -> None:
+    """Remove all materials, balances, and transactions (keeps branches and users)."""
+    conn.execute("DELETE FROM stock_transaction_lines")
+    conn.execute("DELETE FROM stock_transactions")
+    conn.execute("DELETE FROM inventory_balances")
+    conn.execute("DELETE FROM materials")
+    conn.execute("DELETE FROM categories")
 
 
 def seed() -> None:
-    DB_PATH.parent.mkdir(exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA)
         migrate(conn)
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
             return
 
-        conn.executemany(
-            "INSERT INTO users(full_name, email, password_hash, role) VALUES (?, ?, ?, ?)",
-            [
-                ("Admin User", "admin@prostarm.com", hash_password("Admin@12345"), "ADMIN"),
-                ("Store Manager", "store@prostarm.com", hash_password("Store@12345"), "STORE_MANAGER"),
-                ("Viewer User", "viewer@prostarm.com", hash_password("Viewer@12345"), "VIEWER"),
-            ],
-        )
-
-        if import_book1_inventory(conn):
-            return
-
-        conn.executemany(
-            "INSERT INTO branches(code, name, type) VALUES (?, ?, ?)",
-            [
-                ("MUM-WH", "Mumbai Warehouse", "WAREHOUSE"),
-                ("DEL-BR", "Delhi Branch", "BRANCH"),
-                ("BLR-SVC", "Bengaluru Service Center", "SERVICE_CENTER"),
-            ],
-        )
-        conn.executemany(
-            "INSERT INTO categories(name) VALUES (?)",
-            [("Laptops",), ("Networking",), ("Storage",), ("Accessories",)],
-        )
-
-        cat = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM categories")}
-        materials = [
-            ("LAP-DELL-5420", "Dell Latitude 5420", "Business laptop", cat["Laptops"], "PCS", 5, 58000),
-            ("RTR-CISCO-900", "Cisco ISR Router", "Branch router", cat["Networking"], "PCS", 3, 76000),
-            ("SSD-1TB-NVME", "1TB NVMe SSD", "Replacement storage", cat["Storage"], "PCS", 10, 6200),
-            ("KB-MOUSE-COMBO", "Keyboard Mouse Combo", "USB combo kit", cat["Accessories"], "PCS", 20, 850),
-        ]
-        conn.executemany(
-            """
-            INSERT INTO materials(sku, item_name, description, category_id, uom, minimum_stock_level, standard_unit_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            materials,
-        )
-        material_ids = {r["sku"]: r["id"] for r in conn.execute("SELECT id, sku FROM materials")}
-        branch_ids = {r["code"]: r["id"] for r in conn.execute("SELECT id, code FROM branches")}
-        balances = [
-            ("LAP-DELL-5420", "MUM-WH", "GOOD", 12, 58000),
-            ("LAP-DELL-5420", "MUM-WH", "DAMAGED", 1, 42000),
-            ("RTR-CISCO-900", "MUM-WH", "GOOD", 2, 76000),
-            ("SSD-1TB-NVME", "MUM-WH", "GOOD", 35, 6200),
-            ("KB-MOUSE-COMBO", "MUM-WH", "GOOD", 18, 850),
-            ("LAP-DELL-5420", "DEL-BR", "GOOD", 4, 58000),
-            ("RTR-CISCO-900", "DEL-BR", "REJECTED", 1, 76000),
-            ("SSD-1TB-NVME", "BLR-SVC", "GOOD", 8, 6200),
-            ("KB-MOUSE-COMBO", "BLR-SVC", "SCRAP", 3, 200),
-            ("LAP-DELL-5420", "BLR-SVC", "BUYBACK", 2, 18000),
-        ]
-        conn.executemany(
-            """
-            INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [(material_ids[s], branch_ids[b], c, q, p) for s, b, c, q, p in balances],
-        )
-        user_id = conn.execute("SELECT id FROM users WHERE email='admin@prostarm.com'").fetchone()[0]
+        # Single administrator account for login. Update the password after first use.
+        admin_email = os.environ.get("PROSTARM_ADMIN_EMAIL", "admin@prostarm.com")
+        admin_password = os.environ.get("PROSTARM_ADMIN_PASSWORD", "Admin@12345")
         conn.execute(
-            """
-            INSERT INTO stock_transactions(
-              transaction_no, transaction_type, branch_id, reference_no, counterparty_name,
-              department_or_client, transaction_date, remarks, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            ("TXN-SEED-001", "INWARD", branch_ids["MUM-WH"], "PO-SEED", "Seed Supplier", None, "2026-06-19", "Demo opening stock", user_id, now_iso()),
+            "INSERT INTO users(full_name, email, password_hash, role) VALUES (?, ?, ?, ?)",
+            ("Administrator", admin_email, hash_password(admin_password), "ADMIN"),
+        )
+        conn.execute(
+            "INSERT INTO categories(name) VALUES (?) ON CONFLICT (name) DO NOTHING",
+            ("General",),
         )
 
 
@@ -527,7 +554,45 @@ class App(BaseHTTPRequestHandler):
             return self.create_material(user)
         if path == "/api/branches":
             return self.create_branch(user)
+        if path == "/api/imports/stock":
+            return self.import_stock(user)
         return self.send_json(404, {"error": {"code": "NOT_FOUND", "message": "Route not found"}})
+
+    def import_stock(self, user: dict) -> None:
+        if user["role"] == "VIEWER":
+            return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot import stock"}})
+        data = self.read_json()
+        filename = str(data.get("fileName", "upload.xlsx"))
+        content_b64 = data.get("contentBase64", "")
+        branch_id = data.get("branchId")
+        replace = bool(data.get("replace", True))
+        if not content_b64:
+            return self.send_json(400, {"error": {"code": "NO_FILE", "message": "No file content was provided"}})
+        try:
+            raw = base64.b64decode(content_b64.split(",")[-1])
+        except Exception:
+            return self.send_json(400, {"error": {"code": "BAD_FILE", "message": "Could not decode the uploaded file"}})
+        try:
+            rows = parse_stock_file(filename, raw)
+        except Exception:
+            return self.send_json(400, {"error": {"code": "PARSE_FAILED", "message": "Could not read the spreadsheet. Use an .xlsx or .csv file."}})
+        with db() as conn:
+            try:
+                if branch_id:
+                    branch = conn.execute("SELECT id, name FROM branches WHERE id = ?", (int(branch_id),)).fetchone()
+                else:
+                    branch = conn.execute("SELECT id, name FROM branches ORDER BY id LIMIT 1").fetchone()
+                if not branch:
+                    conn.rollback()
+                    return self.send_json(400, {"error": {"code": "NO_BRANCH", "message": "No branch is available to import into"}})
+                if replace:
+                    clear_stock_data(conn)
+                imported = import_stock_rows(conn, rows, int(branch["id"]), int(user["sub"]), filename)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return self.send_json(201, {"imported": imported, "replaced": replace, "branch": branch["name"]})
 
     def static_file(self, name: str) -> None:
         target = (STATIC_DIR / name).resolve()
@@ -560,7 +625,7 @@ class App(BaseHTTPRequestHandler):
                 SELECT ib.id, m.sku, m.item_name, c.name AS category, b.name AS branch,
                        b.id AS branch_id, ib.condition, ib.quantity_on_hand, m.uom,
                        m.minimum_stock_level, ib.average_unit_cost,
-                       ROUND(ib.quantity_on_hand * ib.average_unit_cost, 2) AS stock_value,
+                       ROUND((ib.quantity_on_hand * ib.average_unit_cost)::numeric, 2) AS stock_value,
                        CASE
                          WHEN ib.condition != 'GOOD' THEN 'Unavailable'
                          WHEN ib.quantity_on_hand <= m.minimum_stock_level THEN 'Low Stock'
@@ -651,17 +716,18 @@ class App(BaseHTTPRequestHandler):
                 )
                 user_id = int(user["sub"])
                 tx_no = f"MAT-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
-                tx = conn.execute(
+                tx_id = conn.execute(
                     """
                     INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
                       counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
                     VALUES (?, 'INWARD', ?, ?, ?, NULL, ?, ?, ?, ?)
+                    RETURNING id
                     """,
                     (tx_no, destination_branch_id, f"NEW-{sku}", source_location, dt.date.today().isoformat(), "Opening stock from material creation", user_id, now_iso()),
-                )
+                ).fetchone()[0]
                 conn.execute(
                     "INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_to) VALUES (?, ?, ?, ?, 'GOOD')",
-                    (tx.lastrowid, material_id, opening_quantity, standard_unit_price),
+                    (tx_id, material_id, opening_quantity, standard_unit_price),
                 )
         self.send_json(201, {"id": material_id, "sku": sku})
 
@@ -735,7 +801,7 @@ class App(BaseHTTPRequestHandler):
                 SELECT b.name AS branch, ib.condition, c.name AS category,
                        COUNT(DISTINCT m.id) AS item_count,
                        SUM(ib.quantity_on_hand) AS quantity,
-                       ROUND(SUM(ib.quantity_on_hand * ib.average_unit_cost), 2) AS value
+                       ROUND(SUM(ib.quantity_on_hand * ib.average_unit_cost)::numeric, 2) AS value
                 FROM inventory_balances ib
                 JOIN materials m ON m.id = ib.material_id
                 JOIN categories c ON c.id = m.category_id
@@ -765,7 +831,7 @@ class App(BaseHTTPRequestHandler):
                 f"""
                 SELECT m.sku, m.item_name, c.name AS category, b.name AS branch, ib.condition,
                        ib.quantity_on_hand, m.uom, ib.average_unit_cost,
-                       ROUND(ib.quantity_on_hand * ib.average_unit_cost, 2) AS stock_value
+                       ROUND((ib.quantity_on_hand * ib.average_unit_cost)::numeric, 2) AS stock_value
                 FROM inventory_balances ib
                 JOIN materials m ON m.id = ib.material_id
                 JOIN categories c ON c.id = m.category_id
@@ -835,7 +901,6 @@ class App(BaseHTTPRequestHandler):
             return self.send_json(400, {"error": {"code": "BAD_QUANTITY", "message": "Quantity must be greater than zero"}})
         with db() as conn:
             try:
-                conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
                     "SELECT quantity_on_hand, average_unit_cost FROM inventory_balances WHERE material_id=? AND branch_id=? AND condition='GOOD'",
                     (material_id, branch_id),
@@ -847,15 +912,15 @@ class App(BaseHTTPRequestHandler):
                     return self.send_json(409, {"error": {"code": "INSUFFICIENT_STOCK", "message": "Insufficient GOOD stock", "details": {"available": available, "requested": qty}}})
                 user_id = int(user["sub"])
                 tx_no = f"DSP-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
-                tx = conn.execute(
+                tx_id = conn.execute(
                     """
                     INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
                       counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
                     VALUES (?, 'CONDITION_MOVE', ?, ?, NULL, NULL, ?, ?, ?, ?)
+                    RETURNING id
                     """,
                     (tx_no, branch_id, data.get("referenceNo"), data.get("date") or dt.date.today().isoformat(), data.get("remarks"), user_id, now_iso()),
-                )
-                tx_id = tx.lastrowid
+                ).fetchone()[0]
                 conn.execute(
                     "UPDATE inventory_balances SET quantity_on_hand = quantity_on_hand - ? WHERE material_id=? AND branch_id=? AND condition='GOOD'",
                     (qty, material_id, branch_id),
@@ -894,14 +959,14 @@ class App(BaseHTTPRequestHandler):
             return self.send_json(400, {"error": {"code": "BAD_QUANTITY", "message": "Quantity must be greater than zero"}})
         with db() as conn:
             try:
-                conn.execute("BEGIN IMMEDIATE")
                 user_id = int(user["sub"])
                 tx_no = f"{kind[:3]}-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
-                tx = conn.execute(
+                tx_id = conn.execute(
                     """
                     INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
                       counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
                     """,
                     (
                         tx_no,
@@ -915,8 +980,7 @@ class App(BaseHTTPRequestHandler):
                         user_id,
                         now_iso(),
                     ),
-                )
-                tx_id = tx.lastrowid
+                ).fetchone()[0]
                 if kind == "INWARD":
                     unit_price = float(data.get("unitPrice") or 0)
                     condition = data.get("condition") or "GOOD"

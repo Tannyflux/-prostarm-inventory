@@ -58,13 +58,39 @@ function showLogin() {
   qs("login").classList.remove("hidden");
 }
 
+/* ---------- Modal helpers ---------- */
+function openModal(title, bodyHtml) {
+  qs("modalTitle").textContent = title;
+  qs("modalBody").innerHTML = bodyHtml;
+  qs("modalRoot").classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  return qs("modalBody");
+}
+
+function closeModal() {
+  qs("modalRoot").classList.add("hidden");
+  qs("modalBody").innerHTML = "";
+  document.body.classList.remove("modal-open");
+}
+
+/* ---------- Sidebar (hamburger) ---------- */
+function setSidebar(open) {
+  qs("sidebar").classList.toggle("open", open);
+  qs("sidebarBackdrop").classList.toggle("hidden", !open);
+  qs("menuToggle").setAttribute("aria-expanded", String(open));
+}
+
+function toggleSidebar() {
+  setSidebar(!qs("sidebar").classList.contains("open"));
+}
+
+/* ---------- Data loaders ---------- */
 async function loadBranches() {
   branches = await api("/api/branches");
   const options = [`<option value="all">All Locations</option>`].concat(
     branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`)
   ).join("");
   qs("branchSelect").innerHTML = options;
-  qs("txBranch").innerHTML = branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("");
 }
 
 async function loadMaterials() {
@@ -76,12 +102,18 @@ function materialOptions() {
   return materialCache.map((m) => `<option value="${m.id}">${esc(m.item_name)} (${esc(m.sku)})</option>`).join("");
 }
 
+function branchOptions() {
+  return branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("");
+}
+
+/* ---------- Views ---------- */
 async function setView(view) {
   activeView = view;
   qs("pageTitle").textContent = titles[view];
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
   qs("dashboardView").classList.toggle("hidden", view !== "dashboard");
   qs("moduleView").classList.toggle("hidden", view === "dashboard");
+  setSidebar(false);
   if (view === "dashboard") return loadDashboard();
   await renderModule(view);
 }
@@ -89,9 +121,10 @@ async function setView(view) {
 async function loadDashboard() {
   const branchId = qs("branchSelect").value || "all";
   const condition = qs("conditionSelect").value || "ALL";
-  const [summary, inventory] = await Promise.all([
+  const [summary, inventory, activity] = await Promise.all([
     api(`/api/dashboard?branchId=${branchId}`),
     api(`/api/inventory?branchId=${branchId}&condition=${condition}`),
+    api("/api/activity"),
   ]);
   inventoryCache = inventory;
   qs("totalItems").textContent = summary.totalItems;
@@ -100,9 +133,14 @@ async function loadDashboard() {
   qs("recentActivity").textContent = summary.recentActivity;
   renderBars(summary.byCondition);
   renderInventory(inventory);
+  renderActivity(activity);
 }
 
 function renderBars(rows) {
+  if (!rows.length) {
+    qs("conditionBars").innerHTML = `<p class="muted small">No stock recorded yet. Import your stock sheet from the Imports tab.</p>`;
+    return;
+  }
   const max = Math.max(1, ...rows.map((r) => Number(r.quantity)));
   qs("conditionBars").innerHTML = rows.map((r) => {
     const width = Math.round((Number(r.quantity) / max) * 100);
@@ -110,12 +148,33 @@ function renderBars(rows) {
       <div class="bar-row">
         <strong>${esc(r.condition)}</strong>
         <span class="bar-track"><span class="bar-fill" style="width:${width}%"></span></span>
-        <span>${esc(r.quantity)}</span>
+        <span>${Number(r.quantity).toLocaleString("en-IN")}</span>
       </div>`;
   }).join("");
 }
 
+function renderActivity(rows) {
+  const el = qs("recentActivityList");
+  if (!el) return;
+  if (!rows.length) {
+    el.innerHTML = `<p class="muted small">No recent activity.</p>`;
+    return;
+  }
+  el.innerHTML = rows.map((r) => `
+    <div class="activity-item">
+      <div>
+        <strong>${esc(r.transaction_no)}</strong>
+        <span class="muted small">${esc(r.branch)} &middot; ${esc(r.transaction_date)}</span>
+      </div>
+      <span class="tag tag-${esc((r.transaction_type || "").toLowerCase())}">${esc(r.transaction_type)}</span>
+    </div>`).join("");
+}
+
 function renderInventory(rows) {
+  if (!rows.length) {
+    qs("inventoryRows").innerHTML = `<tr><td colspan="9" class="empty-cell">No stock to display. Use the Imports tab to upload your stock sheet.</td></tr>`;
+    return;
+  }
   qs("inventoryRows").innerHTML = rows.map((r) => {
     const cls = r.status === "Low Stock" ? "Low" : r.status;
     return `
@@ -138,7 +197,7 @@ function table(headers, rows) {
     <div class="table-wrap">
       <table>
         <thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
-        <tbody>${rows}</tbody>
+        <tbody>${rows || `<tr><td colspan="${headers.length}" class="empty-cell">No records yet.</td></tr>`}</tbody>
       </table>
     </div>`;
 }
@@ -155,55 +214,59 @@ async function renderModule(view) {
   if (view === "settings") return renderSettings();
 }
 
+/* ---------- Material Master ---------- */
+let categoryCache = [];
 async function renderMaterials() {
   const [materials, categories] = await Promise.all([loadMaterials(), api("/api/categories")]);
+  categoryCache = categories;
   qs("moduleView").innerHTML = `
-    <section class="panel form-panel">
-      <div class="panel-head">
-        <h3>Add Material</h3>
-      </div>
-      <form id="addMaterialForm" class="module-form">
-        <label>Material ID / SKU <input name="sku" placeholder="Example: BAT-12V-100AH" required></label>
-        <label>Item Name <input name="itemName" placeholder="Material name" required></label>
-        <label>Description <input name="description" placeholder="Optional description"></label>
-        <label>From Location / Supplier <input name="sourceLocation" placeholder="Example: Vendor, customer, old site"></label>
-        <label>To Branch
-          <select name="destinationBranchId" required>
-            ${branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
-          </select>
-        </label>
-        <label>Category
-          <select name="categoryId" required>
-            ${categories.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}
-          </select>
-        </label>
-        <label>UOM <input name="uom" value="PCS" required></label>
-        <label>Minimum Stock Level <input name="minimumStockLevel" type="number" min="0" step="0.001" value="0" required></label>
-        <label>Opening Quantity <input name="openingQuantity" type="number" min="0" step="0.001" value="0" required></label>
-        <label>Standard Unit Price <input name="standardUnitPrice" type="number" min="0" step="0.01" value="0" required></label>
-        <button type="submit">Add Material</button>
-      </form>
-    </section>
     <section class="panel">
       <div class="panel-head">
         <h3>Material Master</h3>
-        <input id="materialSearch" class="search" placeholder="Search SKU or item">
+        <div class="head-actions">
+          <input id="materialSearch" class="search" placeholder="Search SKU or item">
+          <button id="openAddMaterial" type="button">Add Material</button>
+        </div>
       </div>
       ${table(["ID", "SKU", "Item", "From", "To Branch", "Category", "Good Qty", "Total Qty", "Value"], materialRows(materials))}
     </section>`;
   qs("materialSearch").addEventListener("input", (event) => {
     const term = event.target.value.toLowerCase();
-      const filtered = materials.filter((m) => `${m.sku} ${m.item_name}`.toLowerCase().includes(term));
-      qs("moduleView").querySelector("tbody").innerHTML = materialRows(filtered);
+    const filtered = materials.filter((m) => `${m.sku} ${m.item_name}`.toLowerCase().includes(term));
+    qs("moduleView").querySelector("tbody").innerHTML = materialRows(filtered) || `<tr><td colspan="9" class="empty-cell">No matches.</td></tr>`;
   });
-  qs("addMaterialForm").addEventListener("submit", async (event) => {
+  qs("openAddMaterial").addEventListener("click", openMaterialModal);
+}
+
+function openMaterialModal() {
+  const body = openModal("Add Material", `
+    <form id="addMaterialForm" class="module-form">
+      <label>Material ID / SKU <input name="sku" placeholder="Example: BAT-12V-100AH" required></label>
+      <label>Item Name <input name="itemName" placeholder="Material name" required></label>
+      <label class="span-2">Description <input name="description" placeholder="Optional description"></label>
+      <label>From Location / Supplier <input name="sourceLocation" placeholder="Vendor, customer, old site"></label>
+      <label>To Branch
+        <select name="destinationBranchId" required>${branchOptions()}</select>
+      </label>
+      <label>Category
+        <select name="categoryId" required>${categoryCache.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
+      </label>
+      <label>UOM <input name="uom" value="PCS" required></label>
+      <label>Minimum Stock Level <input name="minimumStockLevel" type="number" min="0" step="0.001" value="0" required></label>
+      <label>Opening Quantity <input name="openingQuantity" type="number" min="0" step="0.001" value="0" required></label>
+      <label class="span-2">Standard Unit Price <input name="standardUnitPrice" type="number" min="0" step="0.01" value="0" required></label>
+      <div class="modal-actions span-2">
+        <button type="button" class="ghost" data-close>Cancel</button>
+        <button type="submit">Add Material</button>
+      </div>
+    </form>`);
+  body.querySelector("[data-close]").addEventListener("click", closeModal);
+  body.querySelector("#addMaterialForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
-      const res = await api("/api/materials", {
-        method: "POST",
-        body: JSON.stringify(Object.fromEntries(form.entries())),
-      });
+      const res = await api("/api/materials", { method: "POST", body: JSON.stringify(Object.fromEntries(form.entries())) });
+      closeModal();
       showMessage(`Material added: ${res.sku}`);
       await renderMaterials();
     } catch (err) {
@@ -227,29 +290,43 @@ function materialRows(materials) {
     </tr>`).join("");
 }
 
+/* ---------- Inward / Outward ---------- */
 async function renderStockForm(type) {
   await loadMaterials();
   const isInward = type === "INWARD";
   const title = isInward ? "Receive Inward Stock" : "Issue Outward Stock";
   qs("moduleView").innerHTML = `
-    <section class="panel form-panel">
-      <h3>${title}</h3>
-      <form id="moduleStockForm" class="module-form">
-        <label>Branch <select name="branchId">${branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}</select></label>
-        <label>Material <select name="materialId">${materialOptions()}</select></label>
-        <label>Quantity <input name="quantity" type="number" min="0.001" step="0.001" required></label>
-        ${isInward ? '<label>Unit Price <input name="unitPrice" type="number" min="0" step="0.01" required></label><label>Condition <select name="condition"><option>GOOD</option><option>REJECTED</option><option>DAMAGED</option><option>BUYBACK</option><option>SCRAP</option></select></label>' : ""}
-        <label>Reference No. <input name="referenceNo" placeholder="${isInward ? "PO number" : "Requisition number"}"></label>
-        <label>Remarks <input name="remarks" placeholder="Optional note"></label>
-        <button type="submit">${isInward ? "Save Inward" : "Save Outward"}</button>
-      </form>
-    </section>
     <section class="panel">
-      <h3>${isInward ? "Recent Inward Entries" : "Recent Outward Entries"}</h3>
+      <div class="panel-head">
+        <h3>${isInward ? "Inward Stock" : "Outward Stock"}</h3>
+        <button id="openStockModal" type="button">${title}</button>
+      </div>
       <div id="transactionList"></div>
     </section>`;
-  qs("moduleStockForm").addEventListener("submit", async (event) => submitStockForm(event, type));
+  qs("openStockModal").addEventListener("click", () => openStockModal(type));
   await renderTransactions(type);
+}
+
+function openStockModal(type) {
+  const isInward = type === "INWARD";
+  const title = isInward ? "Receive Inward Stock" : "Issue Outward Stock";
+  const body = openModal(title, `
+    <form id="moduleStockForm" class="module-form">
+      <label>Branch <select name="branchId">${branchOptions()}</select></label>
+      <label>Material <select name="materialId">${materialOptions()}</select></label>
+      <label>Quantity <input name="quantity" type="number" min="0.001" step="0.001" required></label>
+      ${isInward ? `
+        <label>Unit Price <input name="unitPrice" type="number" min="0" step="0.01" required></label>
+        <label>Condition <select name="condition"><option>GOOD</option><option>REJECTED</option><option>DAMAGED</option><option>BUYBACK</option><option>SCRAP</option></select></label>` : ""}
+      <label>Reference No. <input name="referenceNo" placeholder="${isInward ? "PO number" : "Requisition number"}"></label>
+      <label class="span-2">Remarks <input name="remarks" placeholder="Optional note"></label>
+      <div class="modal-actions span-2">
+        <button type="button" class="ghost" data-close>Cancel</button>
+        <button type="submit">${isInward ? "Save Inward" : "Save Outward"}</button>
+      </div>
+    </form>`);
+  body.querySelector("[data-close]").addEventListener("click", closeModal);
+  body.querySelector("#moduleStockForm").addEventListener("submit", (event) => submitStockForm(event, type));
 }
 
 async function submitStockForm(event, type) {
@@ -261,10 +338,9 @@ async function submitStockForm(event, type) {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    closeModal();
     showMessage(`Saved ${res.transactionNo}`);
-    event.currentTarget.reset();
     await renderTransactions(type);
-    await loadDashboard();
   } catch (err) {
     showMessage(err?.error?.message || "Could not save transaction", true);
   }
@@ -283,48 +359,59 @@ async function renderTransactions(type = "ALL") {
       <td>${money.format(r.total_value)}</td>
       <td>${esc(r.created_by)}</td>
     </tr>`).join(""));
-  const target = document.getElementById("transactionList");
+  const target = qs("transactionList");
   if (target) target.innerHTML = html;
   return html;
 }
 
+/* ---------- Dispositions ---------- */
 async function renderDispositions() {
   await loadMaterials();
   const inventory = await api("/api/inventory?condition=ALL");
   const nonGood = inventory.filter((r) => r.condition !== "GOOD");
   qs("moduleView").innerHTML = `
-    <section class="panel form-panel">
-      <h3>Move GOOD Stock to Disposition</h3>
-      <form id="dispositionForm" class="module-form">
-        <label>Branch <select name="branchId">${branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}</select></label>
-        <label>Material <select name="materialId">${materialOptions()}</select></label>
-        <label>Quantity <input name="quantity" type="number" min="0.001" step="0.001" required></label>
-        <label>To Condition <select name="toCondition"><option>DAMAGED</option><option>SCRAP</option><option>REJECTED</option><option>BUYBACK</option></select></label>
-        <label>Remarks <input name="remarks" placeholder="Reason"></label>
-        <button type="submit">Move Stock</button>
-      </form>
-    </section>
     <section class="panel">
-      <h3>Disposition Ledger</h3>
+      <div class="panel-head">
+        <h3>Disposition Ledger</h3>
+        <button id="openDisposition" type="button">Move GOOD Stock to Disposition</button>
+      </div>
       ${table(["SKU", "Item", "Branch", "Condition", "Qty", "Value"], nonGood.map((r) => `
         <tr>
           <td>${esc(r.sku)}</td><td>${esc(r.item_name)}</td><td>${esc(r.branch)}</td>
           <td>${esc(r.condition)}</td><td>${Number(r.quantity_on_hand).toLocaleString("en-IN")}</td><td>${money.format(r.stock_value)}</td>
         </tr>`).join(""))}
     </section>`;
-  qs("dispositionForm").addEventListener("submit", async (event) => {
+  qs("openDisposition").addEventListener("click", openDispositionModal);
+}
+
+function openDispositionModal() {
+  const body = openModal("Move GOOD Stock to Disposition", `
+    <form id="dispositionForm" class="module-form">
+      <label>Branch <select name="branchId">${branchOptions()}</select></label>
+      <label>Material <select name="materialId">${materialOptions()}</select></label>
+      <label>Quantity <input name="quantity" type="number" min="0.001" step="0.001" required></label>
+      <label>To Condition <select name="toCondition"><option>DAMAGED</option><option>SCRAP</option><option>REJECTED</option><option>BUYBACK</option></select></label>
+      <label class="span-2">Remarks <input name="remarks" placeholder="Reason"></label>
+      <div class="modal-actions span-2">
+        <button type="button" class="ghost" data-close>Cancel</button>
+        <button type="submit">Move Stock</button>
+      </div>
+    </form>`);
+  body.querySelector("[data-close]").addEventListener("click", closeModal);
+  body.querySelector("#dispositionForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
       const res = await api("/api/stock/disposition", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget).entries())) });
+      closeModal();
       showMessage(`Saved ${res.transactionNo}`);
       await renderDispositions();
-      await loadDashboard();
     } catch (err) {
       showMessage(err?.error?.message || "Could not move stock", true);
     }
   });
 }
 
+/* ---------- Reports ---------- */
 async function renderReports() {
   const branchId = qs("branchSelect").value || "all";
   const condition = qs("conditionSelect").value || "ALL";
@@ -333,7 +420,7 @@ async function renderReports() {
     <section class="panel">
       <div class="panel-head">
         <h3>Stock Report</h3>
-        <button id="exportStockBtn" class="button-link" type="button">Export CSV</button>
+        <button id="exportStockBtn" type="button">Export CSV</button>
       </div>
       ${table(["Branch", "Condition", "Category", "Items", "Quantity", "Value"], rows.map((r) => `
         <tr>
@@ -358,54 +445,94 @@ async function downloadStockCsv(branchId, condition) {
   URL.revokeObjectURL(url);
 }
 
+/* ---------- Imports ---------- */
 async function renderImports() {
   const activity = await api("/api/activity");
   qs("moduleView").innerHTML = `
-    <section class="panel">
-      <h3>Excel Import</h3>
-      <p class="muted">Book1.xlsx has been imported into the local database as opening Mahape godown stock. Full upload UI is the next build step.</p>
-      <div class="summary-grid">
-        <article><span>Source File</span><strong>Book1.xlsx</strong></article>
-        <article><span>Status</span><strong>Imported</strong></article>
-      </div>
+    <section class="panel form-panel">
+      <div class="panel-head"><h3>Import Stock from Excel / CSV</h3></div>
+      <p class="muted small">Upload your stock sheet. Expected columns in order: <strong>Item Name</strong>, <strong>Quantity</strong>, <strong>Rate</strong>, <strong>Value</strong>. Conditions (damaged, rejected, scrap, buyback) are detected from the item name.</p>
+      <form id="importForm" class="module-form">
+        <label>Target Branch <select name="branchId">${branchOptions()}</select></label>
+        <label>Import Mode
+          <select name="replace">
+            <option value="true">Replace all existing stock</option>
+            <option value="false">Add to existing stock</option>
+          </select>
+        </label>
+        <label class="span-2">Stock File (.xlsx or .csv) <input id="importFile" name="file" type="file" accept=".xlsx,.csv" required></label>
+        <div class="modal-actions span-2">
+          <button type="submit">Upload &amp; Import</button>
+        </div>
+      </form>
+      <p id="importStatus" class="message"></p>
     </section>
     <section class="panel">
-      <h3>Import Activity</h3>
+      <div class="panel-head"><h3>Import Activity</h3></div>
       ${table(["Txn No", "Type", "Branch", "Reference", "Date"], activity.map((r) => `
-        <tr><td>${esc(r.transaction_no)}</td><td>${esc(r.transaction_type)}</td><td>${esc(r.branch)}</td><td>${esc(r.reference_no)}</td><td>${esc(r.transaction_date)}</td></tr>`).join(""))}
+        <tr><td>${esc(r.transaction_no)}</td><td>${esc(r.transaction_type)}</td><td>${esc(r.branch)}</td><td>${esc(r.reference_no || "")}</td><td>${esc(r.transaction_date)}</td></tr>`).join(""))}
     </section>`;
+  qs("importForm").addEventListener("submit", submitImport);
 }
 
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",").pop());
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function submitImport(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const file = qs("importFile").files[0];
+  if (!file) return showMessage("Choose a file first", true);
+  const data = new FormData(form);
+  qs("importStatus").textContent = "Uploading and importing...";
+  try {
+    const contentBase64 = await readFileAsBase64(file);
+    const res = await api("/api/imports/stock", {
+      method: "POST",
+      body: JSON.stringify({
+        fileName: file.name,
+        contentBase64,
+        branchId: data.get("branchId"),
+        replace: data.get("replace") === "true",
+      }),
+    });
+    qs("importStatus").textContent = `Imported ${res.imported} items into ${res.branch}.`;
+    showMessage(`Imported ${res.imported} items`);
+    await renderImports();
+  } catch (err) {
+    qs("importStatus").textContent = "";
+    showMessage(err?.error?.message || "Import failed", true);
+  }
+}
+
+/* ---------- Settings ---------- */
 async function renderSettings() {
-  const [categories, users] = await Promise.all([
-    api("/api/categories"),
-    currentUser?.role === "ADMIN" ? api("/api/users") : Promise.resolve([]),
-  ]);
+  const categories = await api("/api/categories");
   qs("moduleView").innerHTML = `
     <section class="grid">
       <article class="panel">
-        <h3>Branches</h3>
+        <div class="panel-head"><h3>Branches</h3></div>
         ${table(["Code", "Name", "Type"], branches.map((b) => `<tr><td>${esc(b.code)}</td><td>${esc(b.name)}</td><td>${esc(b.type)}</td></tr>`).join(""))}
       </article>
       <article class="panel">
-        <h3>Categories</h3>
+        <div class="panel-head"><h3>Categories</h3></div>
         ${table(["ID", "Name"], categories.map((c) => `<tr><td>${c.id}</td><td>${esc(c.name)}</td></tr>`).join(""))}
       </article>
-    </section>
-    <section class="panel">
-      <h3>Users</h3>
-      ${currentUser?.role === "ADMIN"
-        ? table(["Name", "Email", "Role"], users.map((u) => `<tr><td>${esc(u.full_name)}</td><td>${esc(u.email)}</td><td>${esc(u.role)}</td></tr>`).join(""))
-        : '<p class="muted">Admin access required to view users.</p>'}
     </section>`;
 }
 
+/* ---------- Boot ---------- */
 async function boot() {
   if (!token) return showLogin();
   try {
     const me = await api("/api/auth/me");
     currentUser = me.user;
-    qs("userBadge").textContent = `${currentUser.name} - ${currentUser.role}`;
     await loadBranches();
     await loadMaterials();
     await setView(activeView);
@@ -444,23 +571,15 @@ document.querySelectorAll("nav a[data-view]").forEach((link) => {
   link.addEventListener("click", () => setView(link.dataset.view));
 });
 
+qs("menuToggle").addEventListener("click", toggleSidebar);
+qs("sidebarBackdrop").addEventListener("click", () => setSidebar(false));
+qs("modalClose").addEventListener("click", closeModal);
+qs("modalBackdrop").addEventListener("click", closeModal);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !qs("modalRoot").classList.contains("hidden")) closeModal();
+});
+
 qs("branchSelect").addEventListener("change", () => activeView === "dashboard" ? loadDashboard() : renderModule(activeView));
 qs("conditionSelect").addEventListener("change", () => activeView === "dashboard" ? loadDashboard() : renderModule(activeView));
-
-qs("stockForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  const type = form.get("type");
-  try {
-    const res = await api(type === "INWARD" ? "/api/stock/inward" : "/api/stock/outward", {
-      method: "POST",
-      body: JSON.stringify(Object.fromEntries(form.entries())),
-    });
-    qs("stockMessage").textContent = `Saved ${res.transactionNo}`;
-    await loadDashboard();
-  } catch (err) {
-    qs("stockMessage").textContent = err?.error?.message || "Could not save transaction";
-  }
-});
 
 boot();

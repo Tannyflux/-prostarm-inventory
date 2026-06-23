@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "data" / "prostarm_inventory.db"
+DB_PATH = Path("/tmp/prostarm_inventory.db")
 STATIC_DIR = ROOT / "static"
 WORKBOOK_PATH = ROOT / "Book1.xlsx"
 SECRET = os.environ.get("PROSTARM_SECRET", "change-this-secret-before-production")

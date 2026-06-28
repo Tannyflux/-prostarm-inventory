@@ -16,6 +16,8 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+import psycopg2
+from psycopg2.extras import DictCursor
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,14 +30,75 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 
 def now_iso() -> str:
-    return dt.datetime.now(dt.UTC).isoformat()
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def db():
+    """
+    Dynamically connects to Neon (PostgreSQL) if DATABASE_URL is available.
+    Falls back to a local SQLite file during local development if needed.
+    """
+    if DATABASE_URL:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
+        return PostgresToSQLiteAdapter(conn)
+    else:
+        conn = sqlite3.connect("/tmp/prostarm_inventory.db")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+class PostgresToSQLiteAdapter:
+    """Translates SQLite-style python calls into PostgreSQL-compatible execution."""
+    def __init__(self, pg_conn):
+        self.pg_conn = pg_conn
+        self._cursor = None
+
+    def execute(self, query, params=None):
+        query = query.replace("?", "%s")
+        self._cursor = self.pg_conn.cursor()
+        self._cursor.execute(query, params)
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return row if row is not None else None
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+        
+    def executemany(self, query, params_seq):
+        query = query.replace("?", "%s")
+        self._cursor = self.pg_conn.cursor()
+        self._cursor.executemany(query, params_seq)
+        return self
+
+    def executescript(self, script):
+        self._cursor = self.pg_conn.cursor()
+        self._cursor.execute(script)
+        return self
+
+    def commit(self):
+        self.pg_conn.commit()
+        
+    def rollback(self):
+        self.pg_conn.rollback()
+
+    def close(self):
+        if self._cursor:
+            self._cursor.close()
+        self.pg_conn.close()
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        self.close()
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -59,8 +122,7 @@ def b64json(payload: dict) -> str:
 
 def sign(data: str) -> str:
     digest = hmac.new(SECRET.encode(), data.encode(), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-
+    "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp()),
 
 def create_token(user: sqlite3.Row) -> str:
     header = b64json({"alg": "HS256", "typ": "JWT"})
@@ -83,7 +145,7 @@ def read_token(token: str) -> dict | None:
             return None
         padded = payload + "=" * (-len(payload) % 4)
         data = json.loads(base64.urlsafe_b64decode(padded.encode()))
-        if data.get("exp", 0) < int(dt.datetime.now(dt.UTC).timestamp()):
+        if data.get("exp", 0) < int(dt.timezone.utc).timestamp()):
             return None
         return data
     except Exception:
@@ -802,7 +864,7 @@ class App(BaseHTTPRequestHandler):
                 """,
                 params,
             ).fetchone()[0]
-            recent = conn.execute("SELECT COUNT(*) FROM stock_transactions WHERE created_at >= ?", ((dt.datetime.now(dt.UTC) - dt.timedelta(days=7)).isoformat(),)).fetchone()[0]
+            recent = conn.execute("SELECT COUNT(*) FROM stock_transactions WHERE created_at >= ?", ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(),)).fetchone()[0]
             by_condition = conn.execute(
                 f"""
                 SELECT condition, SUM(quantity_on_hand) AS quantity

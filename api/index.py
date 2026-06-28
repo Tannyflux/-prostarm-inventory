@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app import App, seed
 
-# Initialize the database in /tmp
+# Initialize the database
 try:
     seed()
 except Exception as e:

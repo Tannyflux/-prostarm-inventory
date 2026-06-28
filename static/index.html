@@ -15,10 +15,10 @@
         <h1>Inventory Management System</h1>
         <p class="muted">Branch-wise stock tracking with isolated good, rejected, damaged, buyback, and scrap inventory.</p>
       </div>
-      <form id="loginForm" class="form">
+      <form id="loginForm" onsubmit="return false;">
         <label>Email <input name="email" type="email" value="admin@prostarm.com" required></label>
         <label>Password <input name="password" type="password" value="Admin@12345" required></label>
-        <button type="submit">Login</button>
+        <button id="loginBtn" type="button">Login</button>
         <p id="loginError" class="error"></p>
       </form>
       <div class="demo-credentials">

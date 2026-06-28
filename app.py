@@ -28,7 +28,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 
 def now_iso() -> str:
-    return dt.datetime.now(dt.UTC).isoformat()
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def db() -> sqlite3.Connection:
@@ -59,8 +59,7 @@ def b64json(payload: dict) -> str:
 
 def sign(data: str) -> str:
     digest = hmac.new(SECRET.encode(), data.encode(), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-
+    "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp()),
 
 def create_token(user: sqlite3.Row) -> str:
     header = b64json({"alg": "HS256", "typ": "JWT"})
@@ -83,7 +82,7 @@ def read_token(token: str) -> dict | None:
             return None
         padded = payload + "=" * (-len(payload) % 4)
         data = json.loads(base64.urlsafe_b64decode(padded.encode()))
-        if data.get("exp", 0) < int(dt.datetime.now(dt.UTC).timestamp()):
+        if data.get("exp", 0) < int(dt.timezone.utc).timestamp()):
             return None
         return data
     except Exception:
@@ -802,7 +801,7 @@ class App(BaseHTTPRequestHandler):
                 """,
                 params,
             ).fetchone()[0]
-            recent = conn.execute("SELECT COUNT(*) FROM stock_transactions WHERE created_at >= ?", ((dt.datetime.now(dt.UTC) - dt.timedelta(days=7)).isoformat(),)).fetchone()[0]
+            recent = conn.execute("SELECT COUNT(*) FROM stock_transactions WHERE created_at >= ?", ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(),)).fetchone()[0]
             by_condition = conn.execute(
                 f"""
                 SELECT condition, SUM(quantity_on_hand) AS quantity

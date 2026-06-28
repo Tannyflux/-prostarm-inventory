@@ -99,6 +99,9 @@ class PostgresToSQLiteAdapter:
         else:
             self.rollback()
         self.close()
+        
+    def __iter__(self):
+        return iter(self._cursor.fetchall())
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -366,12 +369,30 @@ def import_book1_inventory(conn: sqlite3.Connection) -> bool:
 
 
 def seed() -> None:
-    DB_PATH.parent.mkdir(exist_ok=True)
+    # We use a standard connection here to run the CREATE TABLE statements
     with db() as conn:
-        conn.executescript(SCHEMA)
-        migrate(conn)
-        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+        # Postgres does not support executescript. We must run each CREATE TABLE individually.
+        # SCHEMA is the string we defined earlier.
+        statements = SCHEMA.split(';')
+        for stmt in statements:
+            if stmt.strip():
+                try:
+                    conn.execute(stmt)
+                except Exception as e:
+                    print(f"Skipping statement: {e}")
+        
+        # Check if users table is populated
+        check = conn.execute("SELECT COUNT(*) FROM users")
+        # In Postgres adapter, the result is fetched like this:
+        count = check.fetchone()[0]
+        
+        if count > 0:
             return
+
+        # Insert users
+        conn.execute("INSERT INTO users(full_name, email, password_hash, role) VALUES (%s, %s, %s, %s)",
+                     ("Admin User", "admin@prostarm.com", hash_password("Admin@12345"), "ADMIN"))
+        conn.commit()
 
         conn.executemany(
             "INSERT INTO users(full_name, email, password_hash, role) VALUES (?, ?, ?, ?)",

@@ -126,13 +126,17 @@ def sign(data: str) -> str:
 
 def create_token(user) -> str:
     header = b64json({"alg": "HS256", "typ": "JWT"})
-    payload = b64json({
+    
+    # We define the dictionary safely with its own curly braces
+    payload_dict = {
         "sub": user["id"],
         "email": user["email"],
         "role": user["role"],
         "name": user["full_name"],
-        "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp()),
-    })
+        "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp())
+    }
+    
+    payload = b64json(payload_dict)
     body = f"{header}.{payload}"
     return f"{body}.{sign(body)}"
 

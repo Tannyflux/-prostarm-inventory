@@ -154,27 +154,24 @@ def read_token(token: str) -> dict | None:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS branches (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   code TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
   type TEXT NOT NULL DEFAULT 'WAREHOUSE'
 );
-
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   full_name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS categories (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
-
 CREATE TABLE IF NOT EXISTS materials (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   sku TEXT NOT NULL UNIQUE,
   item_name TEXT NOT NULL,
   description TEXT,
@@ -185,9 +182,8 @@ CREATE TABLE IF NOT EXISTS materials (
   minimum_stock_level REAL NOT NULL DEFAULT 0,
   standard_unit_price REAL NOT NULL DEFAULT 0
 );
-
 CREATE TABLE IF NOT EXISTS inventory_balances (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   material_id INTEGER NOT NULL REFERENCES materials(id),
   branch_id INTEGER NOT NULL REFERENCES branches(id),
   condition TEXT NOT NULL DEFAULT 'GOOD',
@@ -195,9 +191,8 @@ CREATE TABLE IF NOT EXISTS inventory_balances (
   average_unit_cost REAL NOT NULL DEFAULT 0,
   UNIQUE(material_id, branch_id, condition)
 );
-
 CREATE TABLE IF NOT EXISTS stock_transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   transaction_no TEXT NOT NULL UNIQUE,
   transaction_type TEXT NOT NULL,
   branch_id INTEGER NOT NULL REFERENCES branches(id),
@@ -209,9 +204,8 @@ CREATE TABLE IF NOT EXISTS stock_transactions (
   created_by INTEGER NOT NULL REFERENCES users(id),
   created_at TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS stock_transaction_lines (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   transaction_id INTEGER NOT NULL REFERENCES stock_transactions(id),
   material_id INTEGER NOT NULL REFERENCES materials(id),
   quantity REAL NOT NULL,
@@ -220,8 +214,6 @@ CREATE TABLE IF NOT EXISTS stock_transaction_lines (
   condition_to TEXT
 );
 """
-
-
 def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
@@ -237,10 +229,7 @@ def ensure_branch(conn: sqlite3.Connection, code: str, name: str, branch_type: s
         (code, name, branch_type),
     ).fetchone()[0])
 
-
-def migrate(conn: sqlite3.Connection) -> None:
-    add_column_if_missing(conn, "materials", "source_location", "TEXT")
-    add_column_if_missing(conn, "materials", "destination_branch_id", "INTEGER REFERENCES branches(id)")
+def migrate(conn) -> None:
     ensure_branch(conn, "MAHAPE", "Mahape", "WAREHOUSE")
     ensure_branch(conn, "PUNE", "Pune", "BRANCH")
     ensure_branch(conn, "AHMEDABAD", "Ahmedabad", "BRANCH")

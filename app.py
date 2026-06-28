@@ -145,7 +145,7 @@ def read_token(token: str) -> dict | None:
             return None
         padded = payload + "=" * (-len(payload) % 4)
         data = json.loads(base64.urlsafe_b64decode(padded.encode()))
-        if data.get("exp", 0) < int(dt.timezone.utc).timestamp()):
+        if data.get("exp", 0) < int(dt.datetime.now(dt.timezone.utc).timestamp()):
             return None
         return data
     except Exception:

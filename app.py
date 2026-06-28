@@ -572,20 +572,25 @@ class App(BaseHTTPRequestHandler):
         condition = query.get("condition", ["ALL"])[0]
         clauses = []
         params = []
+        
+        # NOTE: Changed ? to %s for PostgreSQL compatibility
         if branch_id != "all":
-            clauses.append("b.id = ?")
+            clauses.append("b.id = %s")
             params.append(branch_id)
         if condition != "ALL":
-            clauses.append("ib.condition = ?")
+            clauses.append("ib.condition = %s")
             params.append(condition)
+            
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        
         with db() as conn:
+            # Added CAST( ... AS NUMERIC) to satisfy Postgres ROUND() requirements
             rows = conn.execute(
                 f"""
                 SELECT ib.id, m.sku, m.item_name, c.name AS category, b.name AS branch,
                        b.id AS branch_id, ib.condition, ib.quantity_on_hand, m.uom,
                        m.minimum_stock_level, ib.average_unit_cost,
-                       ROUND(ib.quantity_on_hand * ib.average_unit_cost, 2) AS stock_value,
+                       ROUND(CAST(ib.quantity_on_hand * ib.average_unit_cost AS NUMERIC), 2) AS stock_value,
                        CASE
                          WHEN ib.condition != 'GOOD' THEN 'Unavailable'
                          WHEN ib.quantity_on_hand <= m.minimum_stock_level THEN 'Low Stock'
@@ -601,7 +606,7 @@ class App(BaseHTTPRequestHandler):
                 params,
             ).fetchall()
         self.send_json(200, rows_to_dicts(rows))
-
+    
     def materials(self) -> None:
         with db() as conn:
             rows = conn.execute(

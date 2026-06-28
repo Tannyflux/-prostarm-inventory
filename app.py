@@ -124,14 +124,14 @@ def sign(data: str) -> str:
     digest = hmac.new(SECRET.encode(), data.encode(), hashlib.sha256).digest()
     "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp()),
 
-def create_token(user: sqlite3.Row) -> str:
+def create_token(user) -> str:
     header = b64json({"alg": "HS256", "typ": "JWT"})
     payload = b64json({
         "sub": user["id"],
         "email": user["email"],
         "role": user["role"],
         "name": user["full_name"],
-        "exp": int((dt.datetime.now(dt.UTC) + dt.timedelta(hours=8)).timestamp()),
+        "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp()),
     })
     body = f"{header}.{payload}"
     return f"{body}.{sign(body)}"

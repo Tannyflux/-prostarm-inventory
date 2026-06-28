@@ -41,11 +41,24 @@ async function api(path, options = {}) {
   return data;
 }
 
+// ── Message display ────────────────────────────────────────────────────────
+// Uses the persistent #pageMessage bar at the top of the workspace.
+// Falls back to alert() if the element isn't in the DOM yet (e.g. during boot).
+let _msgTimer = null;
 function showMessage(text, isError = false) {
   const el = qs("pageMessage");
+  if (!el) {
+    if (isError) console.error(text);
+    return;
+  }
+  if (_msgTimer) clearTimeout(_msgTimer);
   el.textContent = text;
   el.className = `page-message ${isError ? "error-box" : "success-box"}`;
-  setTimeout(() => el.classList.add("hidden"), 3500);
+  el.classList.remove("hidden");           // belt-and-suspenders: always remove hidden
+  _msgTimer = setTimeout(() => {
+    el.classList.add("hidden");
+    _msgTimer = null;
+  }, 3500);
 }
 
 function showApp() {
@@ -159,9 +172,7 @@ async function renderMaterials() {
   const [materials, categories] = await Promise.all([loadMaterials(), api("/api/categories")]);
   qs("moduleView").innerHTML = `
     <section class="panel form-panel">
-      <div class="panel-head">
-        <h3>Add Material</h3>
-      </div>
+      <div class="panel-head"><h3>Add Material</h3></div>
       <form id="addMaterialForm" class="module-form">
         <label>Material ID / SKU <input name="sku" placeholder="Example: BAT-12V-100AH" required></label>
         <label>Item Name <input name="itemName" placeholder="Material name" required></label>
@@ -191,14 +202,14 @@ async function renderMaterials() {
       </div>
       ${table(["ID", "SKU", "Item", "From", "To Branch", "Category", "Good Qty", "Total Qty", "Value"], materialRows(materials))}
     </section>`;
-  qs("materialSearch").addEventListener("input", (event) => {
-    const term = event.target.value.toLowerCase();
+  qs("materialSearch").addEventListener("input", (e) => {
+    const term = e.target.value.toLowerCase();
     const filtered = materials.filter((m) => `${m.sku} ${m.item_name}`.toLowerCase().includes(term));
     qs("moduleView").querySelector("tbody").innerHTML = materialRows(filtered);
   });
-  qs("addMaterialForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
+  qs("addMaterialForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = new FormData(e.currentTarget);
     try {
       const res = await api("/api/materials", {
         method: "POST",
@@ -235,55 +246,85 @@ async function renderStockForm(type) {
     <section class="panel form-panel">
       <h3>${title}</h3>
       <form id="moduleStockForm" class="module-form">
-        <label>Branch <select name="branchId">${branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}</select></label>
-        <label>Material <select name="materialId">${materialOptions()}</select></label>
+        <label>Branch
+          <select name="branchId">
+            ${branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Material
+          <select name="materialId">${materialOptions()}</select>
+        </label>
         <label>Quantity <input name="quantity" type="number" min="0.001" step="0.001" required></label>
-        ${isInward ? '<label>Unit Price <input name="unitPrice" type="number" min="0" step="0.01" required></label><label>Condition <select name="condition"><option>GOOD</option><option>REJECTED</option><option>DAMAGED</option><option>BUYBACK</option><option>SCRAP</option></select></label>' : ""}
+        ${isInward ? `
+        <label>Unit Price <input name="unitPrice" type="number" min="0" step="0.01" required></label>
+        <label>Condition
+          <select name="condition">
+            <option>GOOD</option><option>REJECTED</option><option>DAMAGED</option>
+            <option>BUYBACK</option><option>SCRAP</option>
+          </select>
+        </label>` : ""}
         <label>Reference No. <input name="referenceNo" placeholder="${isInward ? "PO number" : "Requisition number"}"></label>
         <label>Remarks <input name="remarks" placeholder="Optional note"></label>
-        <button type="submit">${isInward ? "Save Inward" : "Save Outward"}</button>
+        <div id="moduleFormMsg" class="message" style="min-height:1.4em"></div>
+        <button type="submit" id="moduleStockBtn">${isInward ? "Save Inward" : "Save Outward"}</button>
       </form>
     </section>
     <section class="panel">
       <h3>${isInward ? "Recent Inward Entries" : "Recent Outward Entries"}</h3>
       <div id="transactionList"></div>
     </section>`;
-  qs("moduleStockForm").addEventListener("submit", async (event) => submitStockForm(event, type));
+  qs("moduleStockForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = qs("moduleStockBtn");
+    const msgEl = qs("moduleFormMsg");
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+    msgEl.textContent = "";
+    msgEl.style.color = "";
+    const form = new FormData(e.currentTarget);
+    const payload = Object.fromEntries(form.entries());
+    try {
+      const res = await api(isInward ? "/api/stock/inward" : "/api/stock/outward", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      // res.transactionNo is the key the backend returns
+      const txNo = res.transactionNo || res.transaction_no || "OK";
+      msgEl.textContent = `✓ Saved — ${txNo}`;
+      msgEl.style.color = "green";
+      showMessage(`Saved ${txNo}`);
+      e.currentTarget.reset();
+      await renderTransactions(type);
+    } catch (err) {
+      const msg = err?.error?.message || JSON.stringify(err) || "Could not save transaction";
+      msgEl.textContent = `✗ ${msg}`;
+      msgEl.style.color = "red";
+      showMessage(msg, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = isInward ? "Save Inward" : "Save Outward";
+    }
+  });
   await renderTransactions(type);
-}
-
-async function submitStockForm(event, type) {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  const payload = Object.fromEntries(form.entries());
-  try {
-    const res = await api(type === "INWARD" ? "/api/stock/inward" : "/api/stock/outward", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    showMessage(`Saved ${res.transactionNo}`);
-    event.currentTarget.reset();
-    await renderTransactions(type);
-    await loadDashboard();
-  } catch (err) {
-    showMessage(err?.error?.message || "Could not save transaction", true);
-  }
 }
 
 async function renderTransactions(type = "ALL") {
   const rows = await api(`/api/transactions?type=${type}`);
-  const html = table(["Txn No", "Type", "Branch", "Reference", "Date", "Qty", "Value", "Created By"], rows.map((r) => `
-    <tr>
-      <td><strong>${esc(r.transaction_no)}</strong></td>
-      <td>${esc(r.transaction_type)}</td>
-      <td>${esc(r.branch)}</td>
-      <td>${esc(r.reference_no || "")}</td>
-      <td>${esc(r.transaction_date)}</td>
-      <td>${Number(r.total_quantity).toLocaleString("en-IN")}</td>
-      <td>${money.format(r.total_value)}</td>
-      <td>${esc(r.created_by)}</td>
-    </tr>`).join(""));
-  const target = document.getElementById("transactionList");
+  const html = table(
+    ["Txn No", "Type", "Branch", "Reference", "Date", "Qty", "Value", "Created By"],
+    rows.map((r) => `
+      <tr>
+        <td><strong>${esc(r.transaction_no)}</strong></td>
+        <td>${esc(r.transaction_type)}</td>
+        <td>${esc(r.branch)}</td>
+        <td>${esc(r.reference_no || "")}</td>
+        <td>${esc(r.transaction_date)}</td>
+        <td>${Number(r.total_quantity).toLocaleString("en-IN")}</td>
+        <td>${money.format(r.total_value)}</td>
+        <td>${esc(r.created_by)}</td>
+      </tr>`).join("")
+  );
+  const target = qs("transactionList");
   if (target) target.innerHTML = html;
   return html;
 }
@@ -299,7 +340,11 @@ async function renderDispositions() {
         <label>Branch <select name="branchId">${branches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}</select></label>
         <label>Material <select name="materialId">${materialOptions()}</select></label>
         <label>Quantity <input name="quantity" type="number" min="0.001" step="0.001" required></label>
-        <label>To Condition <select name="toCondition"><option>DAMAGED</option><option>SCRAP</option><option>REJECTED</option><option>BUYBACK</option></select></label>
+        <label>To Condition
+          <select name="toCondition">
+            <option>DAMAGED</option><option>SCRAP</option><option>REJECTED</option><option>BUYBACK</option>
+          </select>
+        </label>
         <label>Remarks <input name="remarks" placeholder="Reason"></label>
         <button type="submit">Move Stock</button>
       </form>
@@ -309,16 +354,19 @@ async function renderDispositions() {
       ${table(["SKU", "Item", "Branch", "Condition", "Qty", "Value"], nonGood.map((r) => `
         <tr>
           <td>${esc(r.sku)}</td><td>${esc(r.item_name)}</td><td>${esc(r.branch)}</td>
-          <td>${esc(r.condition)}</td><td>${Number(r.quantity_on_hand).toLocaleString("en-IN")}</td><td>${money.format(r.stock_value)}</td>
+          <td>${esc(r.condition)}</td><td>${Number(r.quantity_on_hand).toLocaleString("en-IN")}</td>
+          <td>${money.format(r.stock_value)}</td>
         </tr>`).join(""))}
     </section>`;
-  qs("dispositionForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
+  qs("dispositionForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
     try {
-      const res = await api("/api/stock/disposition", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget).entries())) });
+      const res = await api("/api/stock/disposition", {
+        method: "POST",
+        body: JSON.stringify(Object.fromEntries(new FormData(e.currentTarget).entries())),
+      });
       showMessage(`Saved ${res.transactionNo}`);
       await renderDispositions();
-      await loadDashboard();
     } catch (err) {
       showMessage(err?.error?.message || "Could not move stock", true);
     }
@@ -338,7 +386,8 @@ async function renderReports() {
       ${table(["Branch", "Condition", "Category", "Items", "Quantity", "Value"], rows.map((r) => `
         <tr>
           <td>${esc(r.branch)}</td><td>${esc(r.condition)}</td><td>${esc(r.category)}</td>
-          <td>${r.item_count}</td><td>${Number(r.quantity).toLocaleString("en-IN")}</td><td>${money.format(r.value)}</td>
+          <td>${r.item_count}</td><td>${Number(r.quantity).toLocaleString("en-IN")}</td>
+          <td>${money.format(r.value)}</td>
         </tr>`).join(""))}
     </section>`;
   qs("exportStockBtn").addEventListener("click", () => downloadStockCsv(branchId, condition));
@@ -363,7 +412,7 @@ async function renderImports() {
   qs("moduleView").innerHTML = `
     <section class="panel">
       <h3>Excel Import</h3>
-      <p class="muted">Book1.xlsx has been imported into the local database as opening Mahape godown stock. Full upload UI is the next build step.</p>
+      <p class="muted">Book1.xlsx has been imported into the local database as opening Mahape godown stock.</p>
       <div class="summary-grid">
         <article><span>Source File</span><strong>Book1.xlsx</strong></article>
         <article><span>Status</span><strong>Imported</strong></article>
@@ -372,7 +421,11 @@ async function renderImports() {
     <section class="panel">
       <h3>Import Activity</h3>
       ${table(["Txn No", "Type", "Branch", "Reference", "Date"], activity.map((r) => `
-        <tr><td>${esc(r.transaction_no)}</td><td>${esc(r.transaction_type)}</td><td>${esc(r.branch)}</td><td>${esc(r.reference_no)}</td><td>${esc(r.transaction_date)}</td></tr>`).join(""))}
+        <tr>
+          <td>${esc(r.transaction_no)}</td><td>${esc(r.transaction_type)}</td>
+          <td>${esc(r.branch)}</td><td>${esc(r.reference_no)}</td>
+          <td>${esc(r.transaction_date)}</td>
+        </tr>`).join(""))}
     </section>`;
 }
 
@@ -419,7 +472,8 @@ async function boot() {
 
 // ── Login ──────────────────────────────────────────────────────────────────
 qs("loginBtn").addEventListener("click", async () => {
-  qs("loginError").textContent = "";
+  const errEl = qs("loginError");
+  errEl.textContent = "";
   const form = new FormData(qs("loginForm"));
   try {
     const res = await api("/api/auth/login", {
@@ -430,7 +484,7 @@ qs("loginBtn").addEventListener("click", async () => {
     localStorage.setItem("prostarm_token", token);
     await boot();
   } catch (err) {
-    qs("loginError").textContent = err?.error?.message || "Login failed";
+    errEl.textContent = err?.error?.message || "Login failed";
   }
 });
 
@@ -439,22 +493,33 @@ document.querySelectorAll("nav a[data-view]").forEach((link) => {
   link.addEventListener("click", () => setView(link.dataset.view));
 });
 
-qs("branchSelect").addEventListener("change", () => activeView === "dashboard" ? loadDashboard() : renderModule(activeView));
-qs("conditionSelect").addEventListener("change", () => activeView === "dashboard" ? loadDashboard() : renderModule(activeView));
+qs("branchSelect").addEventListener("change", () =>
+  activeView === "dashboard" ? loadDashboard() : renderModule(activeView)
+);
+qs("conditionSelect").addEventListener("change", () =>
+  activeView === "dashboard" ? loadDashboard() : renderModule(activeView)
+);
 
-qs("stockForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
+// ── Dashboard quick-entry form ─────────────────────────────────────────────
+qs("stockForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const msgEl = qs("stockMessage");
+  msgEl.textContent = "";
+  const form = new FormData(e.currentTarget);
   const type = form.get("type");
   try {
     const res = await api(type === "INWARD" ? "/api/stock/inward" : "/api/stock/outward", {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(form.entries())),
     });
-    qs("stockMessage").textContent = `Saved ${res.transactionNo}`;
+    const txNo = res.transactionNo || res.transaction_no || "OK";
+    msgEl.textContent = `✓ Saved — ${txNo}`;
+    msgEl.style.color = "green";
     await loadDashboard();
   } catch (err) {
-    qs("stockMessage").textContent = err?.error?.message || "Could not save transaction";
+    const msg = err?.error?.message || "Could not save transaction";
+    msgEl.textContent = `✗ ${msg}`;
+    msgEl.style.color = "red";
   }
 });
 

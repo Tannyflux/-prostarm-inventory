@@ -433,11 +433,21 @@ qs("loginForm").addEventListener("submit", async (event) => {
     qs("loginError").textContent = err?.error?.message || "Login failed";
   }
 });
-
-qs("logoutBtn").addEventListener("click", () => {
-  localStorage.removeItem("prostarm_token");
-  token = null;
-  showLogin();
+// Replace the old 'submit' listener with this:
+qs("loginBtn").addEventListener("click", async () => {
+  qs("loginError").textContent = "";
+  const form = new FormData(qs("loginForm"));
+  try {
+    const res = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: form.get("email"), password: form.get("password") }),
+    });
+    token = res.token;
+    localStorage.setItem("prostarm_token", token);
+    await boot(); // This calls showApp() and loads your data!
+  } catch (err) {
+    qs("loginError").textContent = err?.error?.message || "Login failed";
+  }
 });
 
 document.querySelectorAll("nav a[data-view]").forEach((link) => {

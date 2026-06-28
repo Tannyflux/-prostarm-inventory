@@ -225,12 +225,12 @@ def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, def
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
-def ensure_branch(conn: sqlite3.Connection, code: str, name: str, branch_type: str = "BRANCH") -> int:
-    row = conn.execute("SELECT id FROM branches WHERE code = ?", (code,)).fetchone()
+def ensure_branch(conn, code: str, name: str, branch_type: str = "BRANCH") -> int:
+    row = conn.execute("SELECT id FROM branches WHERE code = %s", (code,)).fetchone()
     if row:
         return int(row["id"])
     return int(conn.execute(
-        "INSERT INTO branches(code, name, type) VALUES (?, ?, ?) RETURNING id",
+        "INSERT INTO branches(code, name, type) VALUES (%s, %s, %s) RETURNING id",
         (code, name, branch_type),
     ).fetchone()[0])
 
@@ -238,6 +238,7 @@ def migrate(conn) -> None:
     ensure_branch(conn, "MAHAPE", "Mahape", "WAREHOUSE")
     ensure_branch(conn, "PUNE", "Pune", "BRANCH")
     ensure_branch(conn, "AHMEDABAD", "Ahmedabad", "BRANCH")
+ 
 
 
 def cell_col(cell_ref: str) -> str:
@@ -630,92 +631,99 @@ class App(BaseHTTPRequestHandler):
         self.send_json(200, rows_to_dicts(rows))
 
     def create_material(self, user: dict) -> None:
-        if user["role"] == "VIEWER":
-            return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot add materials"}})
-        data = self.read_json()
-        sku = str(data.get("sku", "")).strip().upper()
-        item_name = str(data.get("itemName", "")).strip()
-        category_id = data.get("categoryId")
-        source_location = str(data.get("sourceLocation", "")).strip()
-        destination_branch_id = data.get("destinationBranchId")
-        uom = str(data.get("uom", "PCS")).strip().upper() or "PCS"
-        description = str(data.get("description", "")).strip()
-        try:
-            minimum_stock_level = float(data.get("minimumStockLevel") or 0)
-            standard_unit_price = float(data.get("standardUnitPrice") or 0)
-            opening_quantity = float(data.get("openingQuantity") or 0)
-            category_id = int(category_id)
-            destination_branch_id = int(destination_branch_id) if destination_branch_id else None
-        except (TypeError, ValueError):
-            return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "Category, location, minimum stock, opening quantity, and unit price must be valid"}})
-        if not sku or not item_name:
-            return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "SKU and item name are required"}})
-        if minimum_stock_level < 0 or standard_unit_price < 0 or opening_quantity < 0:
-            return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "Minimum stock, opening quantity, and unit price cannot be negative"}})
-        with db() as conn:
-            exists = conn.execute("SELECT id FROM materials WHERE sku = ?", (sku,)).fetchone()
-            if exists:
-                return self.send_json(409, {"error": {"code": "DUPLICATE_SKU", "message": "A material with this SKU already exists"}})
-            category = conn.execute("SELECT id FROM categories WHERE id = ?", (category_id,)).fetchone()
-            if not category:
-                return self.send_json(400, {"error": {"code": "BAD_CATEGORY", "message": "Selected category does not exist"}})
-            if destination_branch_id:
-                branch = conn.execute("SELECT id FROM branches WHERE id = ?", (destination_branch_id,)).fetchone()
-                if not branch:
-                    return self.send_json(400, {"error": {"code": "BAD_BRANCH", "message": "Selected destination branch does not exist"}})
-            material_id = conn.execute(
+    if user["role"] == "VIEWER":
+        return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot add materials"}})
+    data = self.read_json()
+    sku = str(data.get("sku", "")).strip().upper()
+    item_name = str(data.get("itemName", "")).strip()
+    category_id = data.get("categoryId")
+    source_location = str(data.get("sourceLocation", "")).strip()
+    destination_branch_id = data.get("destinationBranchId")
+    uom = str(data.get("uom", "PCS")).strip().upper() or "PCS"
+    description = str(data.get("description", "")).strip()
+    try:
+        minimum_stock_level = float(data.get("minimumStockLevel") or 0)
+        standard_unit_price = float(data.get("standardUnitPrice") or 0)
+        opening_quantity = float(data.get("openingQuantity") or 0)
+        category_id = int(category_id)
+        destination_branch_id = int(destination_branch_id) if destination_branch_id else None
+    except (TypeError, ValueError):
+        return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "Category, location, minimum stock, opening quantity, and unit price must be valid"}})
+    if not sku or not item_name:
+        return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "SKU and item name are required"}})
+    if minimum_stock_level < 0 or standard_unit_price < 0 or opening_quantity < 0:
+        return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "Minimum stock, opening quantity, and unit price cannot be negative"}})
+    with db() as conn:
+        exists = conn.execute("SELECT id FROM materials WHERE sku = %s", (sku,)).fetchone()
+        if exists:
+            return self.send_json(409, {"error": {"code": "DUPLICATE_SKU", "message": "A material with this SKU already exists"}})
+        category = conn.execute("SELECT id FROM categories WHERE id = %s", (category_id,)).fetchone()
+        if not category:
+            return self.send_json(400, {"error": {"code": "BAD_CATEGORY", "message": "Selected category does not exist"}})
+        if destination_branch_id:
+            branch = conn.execute("SELECT id FROM branches WHERE id = %s", (destination_branch_id,)).fetchone()
+            if not branch:
+                return self.send_json(400, {"error": {"code": "BAD_BRANCH", "message": "Selected destination branch does not exist"}})
+        material_id = conn.execute(
+            """
+            INSERT INTO materials(sku, item_name, description, source_location, destination_branch_id,
+                                  category_id, uom, minimum_stock_level, standard_unit_price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (sku, item_name, description, source_location, destination_branch_id,
+             category_id, uom, minimum_stock_level, standard_unit_price),
+        ).fetchone()[0]
+        if opening_quantity > 0 and destination_branch_id:
+            conn.execute(
                 """
-                INSERT INTO materials(sku, item_name, description, source_location, destination_branch_id, category_id, uom, minimum_stock_level, standard_unit_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
+                VALUES (%s, %s, 'GOOD', %s, %s)
+                """,
+                (material_id, destination_branch_id, opening_quantity, standard_unit_price),
+            )
+            user_id = int(user["sub"])
+            tx_no = f"MAT-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
+            tx_id = conn.execute(
+                """
+                INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
+                  counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
+                VALUES (%s, 'INWARD', %s, %s, %s, NULL, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (sku, item_name, description, source_location, destination_branch_id, category_id, uom, minimum_stock_level, standard_unit_price),
-            ).fetchone()[0]
-            if opening_quantity > 0 and destination_branch_id:
-                conn.execute(
-                    """
-                    INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
-                    VALUES (?, ?, 'GOOD', ?, ?)
-                    """,
-                    (material_id, destination_branch_id, opening_quantity, standard_unit_price),
-                )
-                user_id = int(user["sub"])
-                tx_no = f"MAT-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
-                tx = conn.execute(
-                    """
-                    INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
-                      counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
-                    VALUES (?, 'INWARD', ?, ?, ?, NULL, ?, ?, ?, ?)
-                    """,
-                    (tx_no, destination_branch_id, f"NEW-{sku}", source_location, dt.date.today().isoformat(), "Opening stock from material creation", user_id, now_iso()),
-                )
-                conn.execute(
-                    "INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_to) VALUES (?, ?, ?, ?, 'GOOD')",
-                    (tx.lastrowid, material_id, opening_quantity, standard_unit_price),
-                )
-        self.send_json(201, {"id": material_id, "sku": sku})
-
+                (tx_no, destination_branch_id, f"NEW-{sku}", source_location,
+                 dt.date.today().isoformat(), "Opening stock from material creation", user_id, now_iso()),
+            ).fetchone()[0]                          # ← was tx.lastrowid (SQLite-only)
+            conn.execute(
+                """
+                INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_to)
+                VALUES (%s, %s, %s, %s, 'GOOD')
+                """,
+                (tx_id, material_id, opening_quantity, standard_unit_price),
+            )
+    self.send_json(201, {"id": material_id, "sku": sku})
+    
     def create_branch(self, user: dict) -> None:
-        if user["role"] != "ADMIN":
-            return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Admin access required to add branches"}})
-        data = self.read_json()
-        name = str(data.get("name", "")).strip()
-        code = str(data.get("code", "")).strip().upper()
-        branch_type = str(data.get("type", "BRANCH")).strip().upper() or "BRANCH"
-        if not name:
-            return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "Branch name is required"}})
-        if not code:
-            code = "".join(ch if ch.isalnum() else "-" for ch in name.upper()).strip("-")[:24]
-        with db() as conn:
-            existing = conn.execute("SELECT id FROM branches WHERE code = ?", (code,)).fetchone()
-            if existing:
-                return self.send_json(409, {"error": {"code": "DUPLICATE_BRANCH", "message": "A branch with this code already exists"}})
-            branch_id = conn.execute(
-                "INSERT INTO branches(code, name, type) VALUES (?, ?, ?) RETURNING id",
-                (code, name, branch_type),
-            ).fetchone()[0]
-        self.send_json(201, {"id": branch_id, "code": code, "name": name, "type": branch_type})
-
+    if user["role"] != "ADMIN":
+        return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Admin access required to add branches"}})
+    data = self.read_json()
+    name = str(data.get("name", "")).strip()
+    code = str(data.get("code", "")).strip().upper()
+    branch_type = str(data.get("type", "BRANCH")).strip().upper() or "BRANCH"
+    if not name:
+        return self.send_json(400, {"error": {"code": "BAD_INPUT", "message": "Branch name is required"}})
+    if not code:
+        code = "".join(ch if ch.isalnum() else "-" for ch in name.upper()).strip("-")[:24]
+    with db() as conn:
+        existing = conn.execute("SELECT id FROM branches WHERE code = %s", (code,)).fetchone()
+        if existing:
+            return self.send_json(409, {"error": {"code": "DUPLICATE_BRANCH", "message": "A branch with this code already exists"}})
+        branch_id = conn.execute(
+            "INSERT INTO branches(code, name, type) VALUES (%s, %s, %s) RETURNING id",
+            (code, name, branch_type),
+        ).fetchone()[0]
+    self.send_json(201, {"id": branch_id, "code": code, "name": name, "type": branch_type})
+ 
     def transactions(self, query: dict) -> None:
         kind = query.get("type", ["ALL"])[0]
         clauses = []
@@ -851,142 +859,139 @@ class App(BaseHTTPRequestHandler):
             "byCondition": rows_to_dicts(by_condition),
         })
 
-    def disposition(self, user: dict) -> None:
-        if user["role"] == "VIEWER":
-            return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot create stock transactions"}})
-        data = self.read_json()
-        material_id = int(data["materialId"])
-        branch_id = int(data["branchId"])
-        qty = float(data["quantity"])
-        to_condition = data.get("toCondition", "DAMAGED")
-        if to_condition not in {"REJECTED", "DAMAGED", "BUYBACK", "SCRAP"}:
-            return self.send_json(400, {"error": {"code": "BAD_CONDITION", "message": "Disposition condition must be rejected, damaged, buyback, or scrap"}})
-        if qty <= 0:
-            return self.send_json(400, {"error": {"code": "BAD_QUANTITY", "message": "Quantity must be greater than zero"}})
-        with db() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT quantity_on_hand, average_unit_cost FROM inventory_balances WHERE material_id=? AND branch_id=? AND condition='GOOD'",
-                    (material_id, branch_id),
-                ).fetchone()
-                available = float(row["quantity_on_hand"]) if row else 0
-                cost = float(row["average_unit_cost"]) if row else 0
-                if available < qty:
-                    conn.rollback()
-                    return self.send_json(409, {"error": {"code": "INSUFFICIENT_STOCK", "message": "Insufficient GOOD stock", "details": {"available": available, "requested": qty}}})
-                user_id = int(user["sub"])
-                tx_no = f"DSP-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
-                tx = conn.execute(
-                    """
-                    INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
-                      counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
-                    VALUES (?, 'CONDITION_MOVE', ?, ?, NULL, NULL, ?, ?, ?, ?)
-                    """,
-                    (tx_no, branch_id, data.get("referenceNo"), data.get("date") or dt.date.today().isoformat(), data.get("remarks"), user_id, now_iso()),
-                )
-                tx_id = tx.lastrowid
-                conn.execute(
-                    "UPDATE inventory_balances SET quantity_on_hand = quantity_on_hand - ? WHERE material_id=? AND branch_id=? AND condition='GOOD'",
-                    (qty, material_id, branch_id),
-                )
+    # ── App.disposition() ───────────────────────────────────────────
+def disposition(self, user: dict) -> None:
+    if user["role"] == "VIEWER":
+        return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot create stock transactions"}})
+    data = self.read_json()
+    material_id = int(data["materialId"])
+    branch_id = int(data["branchId"])
+    qty = float(data["quantity"])
+    to_condition = data.get("toCondition", "DAMAGED")
+    if to_condition not in {"REJECTED", "DAMAGED", "BUYBACK", "SCRAP"}:
+        return self.send_json(400, {"error": {"code": "BAD_CONDITION", "message": "Disposition condition must be rejected, damaged, buyback, or scrap"}})
+    if qty <= 0:
+        return self.send_json(400, {"error": {"code": "BAD_QUANTITY", "message": "Quantity must be greater than zero"}})
+    with db() as conn:
+        try:
+            row = conn.execute(
+                "SELECT quantity_on_hand, average_unit_cost FROM inventory_balances WHERE material_id=%s AND branch_id=%s AND condition='GOOD'",
+                (material_id, branch_id),
+            ).fetchone()
+            available = float(row["quantity_on_hand"]) if row else 0
+            cost = float(row["average_unit_cost"]) if row else 0
+            if available < qty:
+                conn.rollback()
+                return self.send_json(409, {"error": {"code": "INSUFFICIENT_STOCK", "message": "Insufficient GOOD stock", "details": {"available": available, "requested": qty}}})
+            user_id = int(user["sub"])
+            tx_no = f"DSP-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
+            tx_id = conn.execute(
+                """
+                INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
+                  counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
+                VALUES (%s, 'CONDITION_MOVE', %s, %s, NULL, NULL, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (tx_no, branch_id, data.get("referenceNo"),
+                 data.get("date") or dt.date.today().isoformat(),
+                 data.get("remarks"), user_id, now_iso()),
+            ).fetchone()[0]                          # ← was tx.lastrowid
+            conn.execute(
+                "UPDATE inventory_balances SET quantity_on_hand = quantity_on_hand - %s WHERE material_id=%s AND branch_id=%s AND condition='GOOD'",
+                (qty, material_id, branch_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT(material_id, branch_id, condition)
+                DO UPDATE SET quantity_on_hand  = inventory_balances.quantity_on_hand + EXCLUDED.quantity_on_hand,
+                              average_unit_cost = EXCLUDED.average_unit_cost
+                """,
+                (material_id, branch_id, to_condition, qty, cost),
+            )
+            conn.execute(
+                """
+                INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_from, condition_to)
+                VALUES (%s, %s, %s, %s, 'GOOD', %s)
+                """,
+                (tx_id, material_id, qty, cost, to_condition),
+            )
+        except Exception:
+            conn.rollback()
+            raise
+    self.send_json(201, {"transactionNo": tx_no})
+    
+    # ── App.stock_move() ────────────────────────────────────────────
+def stock_move(self, kind: str, user: dict) -> None:
+    if user["role"] == "VIEWER":
+        return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot create stock transactions"}})
+    data = self.read_json()
+    material_id = int(data["materialId"])
+    branch_id = int(data["branchId"])
+    qty = float(data["quantity"])
+    if qty <= 0:
+        return self.send_json(400, {"error": {"code": "BAD_QUANTITY", "message": "Quantity must be greater than zero"}})
+    with db() as conn:
+        try:
+            user_id = int(user["sub"])
+            tx_no = f"{kind[:3]}-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
+            tx_id = conn.execute(
+                """
+                INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
+                  counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    tx_no, kind, branch_id,
+                    data.get("referenceNo"), data.get("supplierName"), data.get("departmentOrClient"),
+                    data.get("date") or dt.date.today().isoformat(),
+                    data.get("remarks"), user_id, now_iso(),
+                ),
+            ).fetchone()[0]                          # ← was tx.lastrowid
+            if kind == "INWARD":
+                unit_price = float(data.get("unitPrice") or 0)
+                condition = data.get("condition") or "GOOD"
                 conn.execute(
                     """
                     INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT(material_id, branch_id, condition)
-                    DO UPDATE SET quantity_on_hand = quantity_on_hand + excluded.quantity_on_hand,
-                                  average_unit_cost = excluded.average_unit_cost
+                    DO UPDATE SET quantity_on_hand  = inventory_balances.quantity_on_hand + EXCLUDED.quantity_on_hand,
+                                  average_unit_cost = EXCLUDED.average_unit_cost
                     """,
-                    (material_id, branch_id, to_condition, qty, cost),
+                    (material_id, branch_id, condition, qty, unit_price),
                 )
                 conn.execute(
                     """
-                    INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_from, condition_to)
-                    VALUES (?, ?, ?, ?, 'GOOD', ?)
+                    INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_to)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (tx_id, material_id, qty, cost, to_condition),
+                    (tx_id, material_id, qty, unit_price, condition),
                 )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        self.send_json(201, {"transactionNo": tx_no})
-
-    def stock_move(self, kind: str, user: dict) -> None:
-        if user["role"] == "VIEWER":
-            return self.send_json(403, {"error": {"code": "FORBIDDEN", "message": "Viewer cannot create stock transactions"}})
-        data = self.read_json()
-        material_id = int(data["materialId"])
-        branch_id = int(data["branchId"])
-        qty = float(data["quantity"])
-        if qty <= 0:
-            return self.send_json(400, {"error": {"code": "BAD_QUANTITY", "message": "Quantity must be greater than zero"}})
-        with db() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                user_id = int(user["sub"])
-                tx_no = f"{kind[:3]}-{int(dt.datetime.now().timestamp())}-{secrets.randbelow(9999):04d}"
-                tx = conn.execute(
-                    """
-                    INSERT INTO stock_transactions(transaction_no, transaction_type, branch_id, reference_no,
-                      counterparty_name, department_or_client, transaction_date, remarks, created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        tx_no,
-                        kind,
-                        branch_id,
-                        data.get("referenceNo"),
-                        data.get("supplierName"),
-                        data.get("departmentOrClient"),
-                        data.get("date") or dt.date.today().isoformat(),
-                        data.get("remarks"),
-                        user_id,
-                        now_iso(),
-                    ),
+            else:  # OUTWARD
+                row = conn.execute(
+                    "SELECT quantity_on_hand FROM inventory_balances WHERE material_id=%s AND branch_id=%s AND condition='GOOD'",
+                    (material_id, branch_id),
+                ).fetchone()
+                available = float(row["quantity_on_hand"]) if row else 0
+                if available < qty:
+                    conn.rollback()
+                    return self.send_json(409, {"error": {"code": "INSUFFICIENT_STOCK", "message": "Insufficient GOOD stock", "details": {"available": available, "requested": qty}}})
+                conn.execute(
+                    "UPDATE inventory_balances SET quantity_on_hand = quantity_on_hand - %s WHERE material_id=%s AND branch_id=%s AND condition='GOOD'",
+                    (qty, material_id, branch_id),
                 )
-                tx_id = tx.lastrowid
-                if kind == "INWARD":
-                    unit_price = float(data.get("unitPrice") or 0)
-                    condition = data.get("condition") or "GOOD"
-                    conn.execute(
-                        """
-                        INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(material_id, branch_id, condition)
-                        DO UPDATE SET quantity_on_hand = quantity_on_hand + excluded.quantity_on_hand,
-                                      average_unit_cost = excluded.average_unit_cost
-                        """,
-                        (material_id, branch_id, condition, qty, unit_price),
-                    )
-                    conn.execute(
-                        "INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_to) VALUES (?, ?, ?, ?, ?)",
-                        (tx_id, material_id, qty, unit_price, condition),
-                    )
-                else:
-                    row = conn.execute(
-                        "SELECT quantity_on_hand FROM inventory_balances WHERE material_id=? AND branch_id=? AND condition='GOOD'",
-                        (material_id, branch_id),
-                    ).fetchone()
-                    available = float(row["quantity_on_hand"]) if row else 0
-                    if available < qty:
-                        conn.rollback()
-                        return self.send_json(409, {"error": {"code": "INSUFFICIENT_STOCK", "message": "Insufficient GOOD stock", "details": {"available": available, "requested": qty}}})
-                    conn.execute(
-                        "UPDATE inventory_balances SET quantity_on_hand = quantity_on_hand - ? WHERE material_id=? AND branch_id=? AND condition='GOOD'",
-                        (qty, material_id, branch_id),
-                    )
-                    conn.execute(
-                        "INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_from) VALUES (?, ?, ?, 0, 'GOOD')",
-                        (tx_id, material_id, qty),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        self.send_json(201, {"transactionNo": tx_no})
-
+                conn.execute(
+                    "INSERT INTO stock_transaction_lines(transaction_id, material_id, quantity, unit_price, condition_from) VALUES (%s, %s, %s, 0, 'GOOD')",
+                    (tx_id, material_id, qty),
+                )
+        except Exception:
+            conn.rollback()
+            raise
+    self.send_json(201, {"transactionNo": tx_no})
+    
 
 def run() -> None:
     seed()

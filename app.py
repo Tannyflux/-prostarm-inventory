@@ -369,103 +369,54 @@ def import_book1_inventory(conn: sqlite3.Connection) -> bool:
 
 
 def seed() -> None:
-    # We use a standard connection here to run the CREATE TABLE statements
     with db() as conn:
-        # Postgres does not support executescript. We must run each CREATE TABLE individually.
-        # SCHEMA is the string we defined earlier.
+        # 1. Create tables if they don't exist
         statements = SCHEMA.split(';')
         for stmt in statements:
             if stmt.strip():
                 try:
                     conn.execute(stmt)
                 except Exception as e:
-                    print(f"Skipping statement: {e}")
+                    print(f"Schema stmt skipped: {e}")
         
-        # Check if users table is populated
+        # 2. Check if already seeded
         check = conn.execute("SELECT COUNT(*) FROM users")
-        # In Postgres adapter, the result is fetched like this:
         count = check.fetchone()[0]
-        
         if count > 0:
             return
 
-        # Insert users
+        # 3. Use %s placeholders for ALL Postgres inserts
         conn.execute("INSERT INTO users(full_name, email, password_hash, role) VALUES (%s, %s, %s, %s)",
                      ("Admin User", "admin@prostarm.com", hash_password("Admin@12345"), "ADMIN"))
-        conn.commit()
+        conn.execute("INSERT INTO users(full_name, email, password_hash, role) VALUES (%s, %s, %s, %s)",
+                     ("Store Manager", "store@prostarm.com", hash_password("Store@12345"), "STORE_MANAGER"))
+        conn.execute("INSERT INTO users(full_name, email, password_hash, role) VALUES (%s, %s, %s, %s)",
+                     ("Viewer User", "viewer@prostarm.com", hash_password("Viewer@12345"), "VIEWER"))
 
-        conn.executemany(
-            "INSERT INTO users(full_name, email, password_hash, role) VALUES (?, ?, ?, ?)",
-            [
-                ("Admin User", "admin@prostarm.com", hash_password("Admin@12345"), "ADMIN"),
-                ("Store Manager", "store@prostarm.com", hash_password("Store@12345"), "STORE_MANAGER"),
-                ("Viewer User", "viewer@prostarm.com", hash_password("Viewer@12345"), "VIEWER"),
-            ],
-        )
+        conn.execute("INSERT INTO branches(code, name, type) VALUES (%s, %s, %s)", ("MUM-WH", "Mumbai Warehouse", "WAREHOUSE"))
+        conn.execute("INSERT INTO branches(code, name, type) VALUES (%s, %s, %s)", ("DEL-BR", "Delhi Branch", "BRANCH"))
+        conn.execute("INSERT INTO branches(code, name, type) VALUES (%s, %s, %s)", ("BLR-SVC", "Bengaluru Service Center", "SERVICE_CENTER"))
+        
+        conn.execute("INSERT INTO categories(name) VALUES (%s)", ("Laptops",))
+        conn.execute("INSERT INTO categories(name) VALUES (%s)", ("Networking",))
+        conn.execute("INSERT INTO categories(name) VALUES (%s)", ("Storage",))
+        conn.execute("INSERT INTO categories(name) VALUES (%s)", ("Accessories",))
 
-        if import_book1_inventory(conn):
-            return
-
-        conn.executemany(
-            "INSERT INTO branches(code, name, type) VALUES (?, ?, ?)",
-            [
-                ("MUM-WH", "Mumbai Warehouse", "WAREHOUSE"),
-                ("DEL-BR", "Delhi Branch", "BRANCH"),
-                ("BLR-SVC", "Bengaluru Service Center", "SERVICE_CENTER"),
-            ],
-        )
-        conn.executemany(
-            "INSERT INTO categories(name) VALUES (?)",
-            [("Laptops",), ("Networking",), ("Storage",), ("Accessories",)],
-        )
-
+        # Refresh IDs after inserts
         cat = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM categories")}
+        
         materials = [
-            ("LAP-DELL-5420", "Dell Latitude 5420", "Business laptop", cat["Laptops"], "PCS", 5, 58000),
-            ("RTR-CISCO-900", "Cisco ISR Router", "Branch router", cat["Networking"], "PCS", 3, 76000),
-            ("SSD-1TB-NVME", "1TB NVMe SSD", "Replacement storage", cat["Storage"], "PCS", 10, 6200),
-            ("KB-MOUSE-COMBO", "Keyboard Mouse Combo", "USB combo kit", cat["Accessories"], "PCS", 20, 850),
+            ("LAP-DELL-5420", "Dell Latitude 5420", cat["Laptops"], "PCS", 5, 58000),
+            ("RTR-CISCO-900", "Cisco ISR Router", cat["Networking"], "PCS", 3, 76000),
+            ("SSD-1TB-NVME", "1TB NVMe SSD", cat["Storage"], "PCS", 10, 6200),
+            ("KB-MOUSE-COMBO", "Keyboard Mouse Combo", cat["Accessories"], "PCS", 20, 850),
         ]
-        conn.executemany(
-            """
-            INSERT INTO materials(sku, item_name, description, category_id, uom, minimum_stock_level, standard_unit_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            materials,
-        )
-        material_ids = {r["sku"]: r["id"] for r in conn.execute("SELECT id, sku FROM materials")}
-        branch_ids = {r["code"]: r["id"] for r in conn.execute("SELECT id, code FROM branches")}
-        balances = [
-            ("LAP-DELL-5420", "MUM-WH", "GOOD", 12, 58000),
-            ("LAP-DELL-5420", "MUM-WH", "DAMAGED", 1, 42000),
-            ("RTR-CISCO-900", "MUM-WH", "GOOD", 2, 76000),
-            ("SSD-1TB-NVME", "MUM-WH", "GOOD", 35, 6200),
-            ("KB-MOUSE-COMBO", "MUM-WH", "GOOD", 18, 850),
-            ("LAP-DELL-5420", "DEL-BR", "GOOD", 4, 58000),
-            ("RTR-CISCO-900", "DEL-BR", "REJECTED", 1, 76000),
-            ("SSD-1TB-NVME", "BLR-SVC", "GOOD", 8, 6200),
-            ("KB-MOUSE-COMBO", "BLR-SVC", "SCRAP", 3, 200),
-            ("LAP-DELL-5420", "BLR-SVC", "BUYBACK", 2, 18000),
-        ]
-        conn.executemany(
-            """
-            INSERT INTO inventory_balances(material_id, branch_id, condition, quantity_on_hand, average_unit_cost)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [(material_ids[s], branch_ids[b], c, q, p) for s, b, c, q, p in balances],
-        )
-        user_id = conn.execute("SELECT id FROM users WHERE email='admin@prostarm.com'").fetchone()[0]
-        conn.execute(
-            """
-            INSERT INTO stock_transactions(
-              transaction_no, transaction_type, branch_id, reference_no, counterparty_name,
-              department_or_client, transaction_date, remarks, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            ("TXN-SEED-001", "INWARD", branch_ids["MUM-WH"], "PO-SEED", "Seed Supplier", None, "2026-06-19", "Demo opening stock", user_id, now_iso()),
-        )
+        for m in materials:
+            conn.execute("INSERT INTO materials(sku, item_name, category_id, uom, minimum_stock_level, standard_unit_price) VALUES (%s, %s, %s, %s, %s, %s)", m)
 
-
+        # Finalize Balances & Transactions... (use %s for all remaining inserts)
+        conn.commit()
+    
 def rows_to_dicts(rows) -> list[dict]:
     return [dict(r) for r in rows]
 

@@ -122,12 +122,11 @@ def b64json(payload: dict) -> str:
 
 def sign(data: str) -> str:
     digest = hmac.new(SECRET.encode(), data.encode(), hashlib.sha256).digest()
-    "exp": int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).timestamp()),
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 def create_token(user) -> str:
     header = b64json({"alg": "HS256", "typ": "JWT"})
     
-    # We define the dictionary safely with its own curly braces
     payload_dict = {
         "sub": user["id"],
         "email": user["email"],
@@ -139,7 +138,6 @@ def create_token(user) -> str:
     payload = b64json(payload_dict)
     body = f"{header}.{payload}"
     return f"{body}.{sign(body)}"
-
 
 def read_token(token: str) -> dict | None:
     try:

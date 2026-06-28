@@ -193,8 +193,8 @@ async function renderMaterials() {
     </section>`;
   qs("materialSearch").addEventListener("input", (event) => {
     const term = event.target.value.toLowerCase();
-      const filtered = materials.filter((m) => `${m.sku} ${m.item_name}`.toLowerCase().includes(term));
-      qs("moduleView").querySelector("tbody").innerHTML = materialRows(filtered);
+    const filtered = materials.filter((m) => `${m.sku} ${m.item_name}`.toLowerCase().includes(term));
+    qs("moduleView").querySelector("tbody").innerHTML = materialRows(filtered);
   });
   qs("addMaterialForm").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -417,36 +417,7 @@ async function boot() {
   }
 }
 
-// Ensure we don't declare token twice
-if (typeof token === 'undefined') {
-    var token = localStorage.getItem("prostarm_token");
-}
-
-const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
-
-function qs(id) { return document.getElementById(id); }
-
-// Login logic - safely check if form exists before adding listener
-const loginForm = qs("loginForm");
-if (loginForm) {
-    loginForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const form = new FormData(event.currentTarget);
-        try {
-            const res = await api("/api/auth/login", {
-                method: "POST",
-                body: JSON.stringify({ email: form.get("email"), password: form.get("password") }),
-            });
-            token = res.token;
-            localStorage.setItem("prostarm_token", token);
-            await boot();
-        } catch (err) {
-            const errEl = qs("loginError");
-            if (errEl) errEl.textContent = err?.error?.message || "Login failed";
-        }
-    });
-}
-// Replace the old 'submit' listener with this:
+// ── Login ──────────────────────────────────────────────────────────────────
 qs("loginBtn").addEventListener("click", async () => {
   qs("loginError").textContent = "";
   const form = new FormData(qs("loginForm"));
@@ -457,12 +428,13 @@ qs("loginBtn").addEventListener("click", async () => {
     });
     token = res.token;
     localStorage.setItem("prostarm_token", token);
-    await boot(); // This calls showApp() and loads your data!
+    await boot();
   } catch (err) {
     qs("loginError").textContent = err?.error?.message || "Login failed";
   }
 });
 
+// ── Nav ────────────────────────────────────────────────────────────────────
 document.querySelectorAll("nav a[data-view]").forEach((link) => {
   link.addEventListener("click", () => setView(link.dataset.view));
 });

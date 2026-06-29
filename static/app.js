@@ -283,26 +283,42 @@ async function renderStockForm(type) {
     msgEl.style.color = "";
     const form = new FormData(e.currentTarget);
     const payload = Object.fromEntries(form.entries());
+
+    // ── Step 1: save ──────────────────────────────────────────
+    let saveOk = false;
+    let txNo = "";
     try {
       const res = await api(isInward ? "/api/stock/inward" : "/api/stock/outward", {
         method: "POST",
         body: JSON.stringify(payload),
       });
-      // res.transactionNo is the key the backend returns
-      const txNo = res.transactionNo || res.transaction_no || "OK";
-      msgEl.textContent = `✓ Saved — ${txNo}`;
-      msgEl.style.color = "green";
-      showMessage(`Saved ${txNo}`);
-      e.currentTarget.reset();
-      await renderTransactions(type);
+      txNo = res.transactionNo || res.transaction_no || "saved";
+      saveOk = true;
     } catch (err) {
-      const msg = err?.error?.message || JSON.stringify(err) || "Could not save transaction";
+      // Extract a human-readable message; never show raw {}
+      let msg = "Could not save transaction";
+      if (err?.error?.message) msg = err.error.message;
+      else if (typeof err === "string" && err.trim()) msg = err;
+      else if (err?.message) msg = err.message;
       msgEl.textContent = `✗ ${msg}`;
       msgEl.style.color = "red";
       showMessage(msg, true);
     } finally {
       btn.disabled = false;
       btn.textContent = isInward ? "Save Inward" : "Save Outward";
+    }
+
+    if (!saveOk) return;
+
+    // ── Step 2: show success and refresh list (independently) ─
+    msgEl.textContent = `✓ Saved — ${txNo}`;
+    msgEl.style.color = "green";
+    showMessage(`Saved ${txNo}`);
+    e.currentTarget.reset();
+    try {
+      await renderTransactions(type);
+    } catch (_) {
+      // list refresh failing doesn't undo the save
     }
   });
   await renderTransactions(type);
@@ -505,21 +521,29 @@ qs("stockForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const msgEl = qs("stockMessage");
   msgEl.textContent = "";
+  msgEl.style.color = "";
   const form = new FormData(e.currentTarget);
   const type = form.get("type");
+  let saveOk = false;
   try {
     const res = await api(type === "INWARD" ? "/api/stock/inward" : "/api/stock/outward", {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(form.entries())),
     });
-    const txNo = res.transactionNo || res.transaction_no || "OK";
+    const txNo = res.transactionNo || res.transaction_no || "saved";
     msgEl.textContent = `✓ Saved — ${txNo}`;
     msgEl.style.color = "green";
-    await loadDashboard();
+    saveOk = true;
   } catch (err) {
-    const msg = err?.error?.message || "Could not save transaction";
+    let msg = "Could not save transaction";
+    if (err?.error?.message) msg = err.error.message;
+    else if (typeof err === "string" && err.trim()) msg = err;
+    else if (err?.message) msg = err.message;
     msgEl.textContent = `✗ ${msg}`;
     msgEl.style.color = "red";
+  }
+  if (saveOk) {
+    try { await loadDashboard(); } catch (_) {}
   }
 });
 

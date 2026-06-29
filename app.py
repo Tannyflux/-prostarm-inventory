@@ -90,8 +90,14 @@ class PostgresToSQLiteAdapter:
         if exc_type is None:
             self.commit()
         else:
-            self.rollback()
-        self.close()
+            try:
+                self.rollback()
+            except Exception:
+                pass
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __iter__(self):
         return iter(self._cursor.fetchall())
@@ -623,7 +629,7 @@ class App(BaseHTTPRequestHandler):
                     """,
                     (tx_id, material_id, opening_quantity, standard_unit_price),
                 )
-        self.send_json(201, {"id": material_id, "sku": sku})
+            self.send_json(201, {"id": material_id, "sku": sku})
 
     def create_branch(self, user: dict) -> None:
         if user["role"] != "ADMIN":
@@ -644,7 +650,7 @@ class App(BaseHTTPRequestHandler):
                 "INSERT INTO branches(code, name, type) VALUES (%s, %s, %s) RETURNING id",
                 (code, name, branch_type),
             ).fetchone()[0]
-        self.send_json(201, {"id": branch_id, "code": code, "name": name, "type": branch_type})
+            self.send_json(201, {"id": branch_id, "code": code, "name": name, "type": branch_type})
 
     def transactions(self, query: dict) -> None:
         kind = query.get("type", ["ALL"])[0]
